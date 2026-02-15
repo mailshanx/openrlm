@@ -47,7 +47,13 @@ Fetch a web page or PDF and return its content as markdown.
 Two modes: focused (provide `objective` and/or `search_queries` for relevant excerpts) \
 or full (`full_content=True` for the entire page).
 At least one of `objective`, `search_queries`, or `full_content=True` is required.
-Returns a JSON string with keys: url, title, publish_date, and either excerpts or full_content.""",
+Returns a JSON string with keys: url, title, publish_date, and either excerpts or full_content.
+
+Example:
+```python
+page = await internet_extract(url='https://example.com/report.pdf', objective='key findings')
+print(page)
+```""",
     )
     registry.register(
         "internet_search",
@@ -58,7 +64,13 @@ At least one of `objective` or `search_queries` required; both recommended.
 Query syntax (semicolon-separated): AND, OR, "exact phrase", -exclude, wildcard*
 Use `include_domains`/`exclude_domains` instead of site: operators in queries.
 `after_date` (YYYY-MM-DD) is a soft signal — older results may still appear.
-Returns a JSON string with key 'results', a list of {url, title, publish_date, excerpts}.""",
+Returns a JSON string with key 'results', a list of {url, title, publish_date, excerpts}.
+
+Example:
+```python
+results = await internet_search(objective='recent advances in fusion energy', search_queries='fusion energy 2025; tokamak breakthrough')
+print(results)
+```""",
     )
     config = AgentConfig(
         model=args.model,

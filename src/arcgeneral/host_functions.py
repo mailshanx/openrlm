@@ -80,10 +80,8 @@ class HostFunctionRegistry:
         if not self._functions:
             return ""
         lines = ["## Kernel functions", "",
-                 "These are async Python functions pre-defined in the IPython kernel. "
-                 "They are NOT tools — do NOT call them as tool calls. "
-                 "Call them using `await` inside the python tool. "
-                 "Example: use the python tool with code `result = await internet_search(objective='...'); print(result)`",
+                 "Async Python functions available in the IPython kernel. "
+                 "Call them with `await` inside the python tool.",
                  ""]
         for name, (fn, param_names, description) in self._functions.items():
             sig = inspect.signature(fn)
