@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import sys
 
 from openrouter import OpenRouter
 
@@ -26,17 +27,16 @@ and produce visualizations.
 async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict) -> str:
     """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
     for round_num in range(config.max_tool_rounds):
-        logger.info("Round %d", round_num + 1)
 
         response = await client.chat.send_async(
             messages=messages,
             **request_kwargs,
         )
 
-        logger.debug(response)
         choice = response.choices[0]
         msg = choice.message
-
+        u = response.usage
+        print(f"[model={response.model} finish={choice.finish_reason} tokens={f'{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}' if u else '?'}]")
         if msg.content:
             print(f"[LLM] {msg.content}")
         if msg.tool_calls:
