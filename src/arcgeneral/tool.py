@@ -8,8 +8,10 @@ PYTHON_TOOL_SCHEMA = {
     "function": {
         "name": "python",
         "description": (
-            "Execute Python code in a stateful IPython environment. "
-            "Variables, imports, and function definitions persist across calls."
+            "Execute Python code in a persistent IPython environment. "
+            "Variables, imports, and function definitions persist across calls. "
+            "Common libraries are pre-installed (numpy, pandas, matplotlib, scipy, etc.). "
+            "Returns stdout/stderr output, or an error traceback if the code fails."
         ),
         "parameters": {
             "type": "object",

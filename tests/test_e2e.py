@@ -119,7 +119,7 @@ async def test_cli_parse_defaults():
         sys.argv = ["arcgeneral", "hello world"]
         args = parse_args()
         report("cli_message", args.message == "hello world")
-        report("cli_default_model", args.model == "openai/gpt-4o-mini")
+        report("cli_default_model", args.model == "qwen/qwen3-coder-next")
         report("cli_default_api_key_env", args.api_key_env_var == "OPENROUTER_API_KEY")
         report("cli_default_image", args.image == "arcgeneral:sandbox")
         report("cli_default_timeout", args.timeout == 120.0)

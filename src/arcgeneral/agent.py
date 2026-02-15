@@ -13,18 +13,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a helpful assistant with access to a stateful Python execution environment.
-
-## python tool
-
-Use the python tool to execute code in a persistent IPython kernel. The environment \
-is a Jupyter notebook — variables, imports, and function definitions persist across \
-calls. Common libraries are pre-installed (numpy, pandas, matplotlib, scipy, etc.).
-
-The tool returns stdout/stderr output from execution, or an error traceback if \
-the code fails. If no output is produced, you'll see a confirmation message.
-
 ### Guidelines
-
 - Use code execution to verify your reasoning, perform calculations, analyze data, \
 and produce visualizations.
 - Define reusable functions when you'll need similar logic again — they persist.
