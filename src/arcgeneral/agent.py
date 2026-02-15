@@ -33,7 +33,7 @@ async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config
             **request_kwargs,
         )
 
-        print(response)
+        logger.debug(response)
         choice = response.choices[0]
         msg = choice.message
 
