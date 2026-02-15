@@ -79,8 +79,8 @@ class HostFunctionRegistry:
         """Return a system prompt section describing all registered functions."""
         if not self._functions:
             return ""
-        lines = ["## Kernel functions", "",
-                 "The following async functions are pre-loaded in the Python kernel. "
+        lines = ["## Built-in functions", "",
+                 "The following async functions are available in the Python environment. "
                  "To use them, call the python tool with code that awaits them. "
                  "For example, to search the web, call the python tool with this code:", "",
                  "    results = await internet_search(objective='...', search_queries='...')",
