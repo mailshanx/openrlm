@@ -79,7 +79,12 @@ class HostFunctionRegistry:
         """Return a system prompt section describing all registered functions."""
         if not self._functions:
             return ""
-        lines = ["## Kernel functions", ""]
+        lines = ["## Kernel functions", "",
+                 "These are async Python functions pre-defined in the IPython kernel. "
+                 "They are NOT tools — do NOT call them as tool calls. "
+                 "Call them using `await` inside the python tool. "
+                 "Example: use the python tool with code `result = await internet_search(objective='...'); print(result)`",
+                 ""]
         for name, (fn, param_names, description) in self._functions.items():
             sig = inspect.signature(fn)
             params = []
