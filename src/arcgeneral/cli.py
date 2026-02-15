@@ -49,11 +49,7 @@ or full (`full_content=True` for the entire page).
 At least one of `objective`, `search_queries`, or `full_content=True` is required.
 Returns a JSON string with keys: url, title, publish_date, and either excerpts or full_content.
 
-Example:
-```python
-page = await internet_extract(url='https://example.com/report.pdf', objective='key findings')
-print(page)
-```""",
+Example: page = await internet_extract(url='https://example.com/report.pdf', objective='key findings')""",
     )
     registry.register(
         "internet_search",
@@ -66,11 +62,7 @@ Use `include_domains`/`exclude_domains` instead of site: operators in queries.
 `after_date` (YYYY-MM-DD) is a soft signal — older results may still appear.
 Returns a JSON string with key 'results', a list of {url, title, publish_date, excerpts}.
 
-Example:
-```python
-results = await internet_search(objective='recent advances in fusion energy', search_queries='fusion energy 2025; tokamak breakthrough')
-print(results)
-```""",
+Example: results = await internet_search(objective='recent advances in fusion energy', search_queries='fusion energy 2025; tokamak breakthrough')""",
     )
     config = AgentConfig(
         model=args.model,
