@@ -28,11 +28,18 @@ async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config
     for round_num in range(config.max_tool_rounds):
         logger.info("Round %d", round_num + 1)
 
-        response = await client.chat.send_async(
-            messages=messages,
-            **request_kwargs,
-        )
+        try:
+            response = await client.chat.send_async(
+                messages=messages,
+                **request_kwargs,
+            )
+        except Exception as e:
+            print(f"[API error] {type(e).__name__}: {e}")
+            return f"API error: {e}"
 
+        if not response.choices:
+            print("[API error] Empty response from API (no choices)")
+            return "API error: empty response"
         choice = response.choices[0]
         msg = choice.message
 
@@ -61,7 +68,9 @@ async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config
             ]
         messages.append(assistant_msg)
 
-        if str(choice.finish_reason) == "stop" or not msg.tool_calls:
+        if not msg.tool_calls:
+            if not msg.content:
+                print(f"[API warning] Empty response (finish_reason={choice.finish_reason})")
             return msg.content or ""
 
         for tc in msg.tool_calls:
