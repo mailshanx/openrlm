@@ -40,7 +40,7 @@ STUB_TEMPLATE = """\
 async def $name($sig):
     _kwargs = {}
 $kwargs_lines
-    async with _httpx.AsyncClient() as _client:
+    async with _httpx.AsyncClient(timeout=_httpx.Timeout(300)) as _client:
         _resp = await _client.post(f"{_HOST_FUNCTION_URL}/$name", json={"kwargs": _kwargs})
     _body = _resp.json()
     if "error" in _body:
