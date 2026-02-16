@@ -80,7 +80,7 @@ async def execute_internet_extract(
     extract_response = client.beta.extract(**api_kwargs)
 
     if extract_response.errors:
-        error_msgs = [f"{e.url}: {e.message}" for e in extract_response.errors]
+        error_msgs = [f"{e.url}: {e.error_type}" for e in extract_response.errors]
         raise RuntimeError(f"Extraction failed: {'; '.join(error_msgs)}")
 
     if not extract_response.results:
