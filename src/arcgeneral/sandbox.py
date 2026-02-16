@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Code cells executed in every new kernel before the agent loop starts.
 # Add setup code here (imports, helpers, data loading, etc.).
-KERNEL_PREAMBLE: list[str] = []
+KERNEL_PREAMBLE: list[str] = ["import asyncio"]
 
 
 class _Container(ExecutionContainer):
