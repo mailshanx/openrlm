@@ -15,7 +15,7 @@ class AgentConfig:
     sandbox_image: str = "arcgeneral:sandbox"
     code_timeout: float = 120.0
     max_tool_rounds: int = 50
-    max_sub_agent_depth: int = 2
+    max_sub_agent_depth: int = 10
     output_limit_lines: int = 2000
     output_limit_bytes: int = 50_000
     temperature: float | None = None
