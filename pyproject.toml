@@ -9,6 +9,7 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "parallel-web>=0.3.4",
     "aiohttp>=3.9.0",
+    "httpx[http2]>=0.28.1",
 ]
 
 [project.scripts]

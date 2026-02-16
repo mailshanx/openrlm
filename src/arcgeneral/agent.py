@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Self
 
 from openrouter import OpenRouter
+import httpx
 
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
@@ -66,7 +67,6 @@ expertise, and constraints. Use `task` for the actual work.\
 class _SubAgent:
     """State for a sub-agent created by the main agent."""
     sandbox: Sandbox
-    client: OpenRouter
     messages: list
     request_kwargs: dict
     depth: int
@@ -80,6 +80,7 @@ class AgentRuntime:
         self._registry = registry
         self._sub_agents: dict[str, _SubAgent] = {}
         self._inflight_tasks: set[asyncio.Task] = set()
+        self._http_client: httpx.AsyncClient | None = None
         self._server: HostFunctionServer | None = None
         self._main_sandbox: Sandbox | None = None
         self._client: OpenRouter | None = None
@@ -133,8 +134,13 @@ class AgentRuntime:
         # Inject agent identity for depth tracking
         await self._inject_agent_id(self._main_sandbox, "main")
 
-        # Init LLM client and messages
-        self._client, self._messages, self._request_kwargs = self._make_client_and_messages(self._config)
+        # Init shared LLM client (HTTP/2) and messages
+        api_key = os.environ.get(self._config.api_key_env_var)
+        if api_key is None:
+            raise ValueError(f"{self._config.api_key_env_var} is not set")
+        self._http_client = httpx.AsyncClient(http2=True, follow_redirects=True)
+        self._client = OpenRouter(api_key=api_key, async_client=self._http_client)
+        self._messages, self._request_kwargs = self._init_messages(self._config)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -171,14 +177,18 @@ class AgentRuntime:
             finally:
                 self._server = None
 
-    def _make_client_and_messages(self, config: AgentConfig, extra_instructions: str | None = None) -> tuple[OpenRouter, list, dict]:
-        """Create an OpenRouter client, seed the messages list, and build request kwargs."""
-        api_key = os.environ.get(config.api_key_env_var)
-        if api_key is None:
-            raise ValueError(f"{config.api_key_env_var} is not set")
+        # Close shared HTTP client
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                logger.warning("Failed to close HTTP client", exc_info=True)
+            finally:
+                self._http_client = None
+                self._client = None
 
-        client = OpenRouter(api_key=api_key)
-
+    def _init_messages(self, config: AgentConfig, extra_instructions: str | None = None) -> tuple[list, dict]:
+        """Seed the messages list and build request kwargs."""
         messages: list = []
         system_prompt = config.system_prompt if config.system_prompt is not None else DEFAULT_SYSTEM_PROMPT
         functions_json = self._registry.build_schemas_json()
@@ -193,8 +203,7 @@ class AgentRuntime:
         }
         if config.temperature is not None:
             request_kwargs["temperature"] = config.temperature
-
-        return client, messages, request_kwargs
+        return messages, request_kwargs
 
     async def _inject_agent_id(self, sandbox: Sandbox, agent_id: str) -> None:
         """Inject _AGENT_ID and rewrap create_agent to pass it automatically for depth tracking."""
@@ -246,18 +255,18 @@ class AgentRuntime:
         compressed.extend(full_history[last_user_idx:])
         return compressed
 
-    async def _llm_call(self, client: OpenRouter, messages: list, request_kwargs: dict):
+    async def _llm_call(self, messages: list, request_kwargs: dict):
         """Single LLM call. Separated for easy extension with retry logic."""
-        return await client.chat.send_async(
+        return await self._client.chat.send_async(
             messages=messages,
             **request_kwargs,
         )
 
-    async def _run_turn(self, client: OpenRouter, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main") -> str:
+    async def _run_turn(self, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main") -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
         for round_num in range(config.max_tool_rounds):
             compressed = self._compress_messages(full_history)
-            response = await self._llm_call(client, compressed, request_kwargs)
+            response = await self._llm_call(compressed, request_kwargs)
 
             choice = response.choices[0]
             msg = choice.message
@@ -337,14 +346,12 @@ class AgentRuntime:
         await sandbox.__aenter__()
         await self._inject_agent_id(sandbox, agent_id)
 
-        client, messages, request_kwargs = self._make_client_and_messages(
+        messages, request_kwargs = self._init_messages(
             self._config,
             extra_instructions=instructions,
         )
-
         self._sub_agents[agent_id] = _SubAgent(
             sandbox=sandbox,
-            client=client,
             messages=messages,
             request_kwargs=request_kwargs,
             depth=depth + 1,
@@ -365,7 +372,7 @@ class AgentRuntime:
 
             logger.info("[runtime] Running task on sub-agent %s: %s", agent_id, task[:100])
             sub.messages.append({"role": "user", "content": task})
-            result = await self._run_turn(sub.client, sub.messages, sub.sandbox, self._config, sub.request_kwargs, agent_label=agent_id)
+            result = await self._run_turn(sub.messages, sub.sandbox, self._config, sub.request_kwargs, agent_label=agent_id)
             logger.info("[runtime] Sub-agent %s finished", agent_id)
             return result
         finally:
@@ -378,7 +385,7 @@ class AgentRuntime:
         """Run the agent loop for a single message. Returns the final text response."""
         logger.info("[user] %s", user_message)
         self._messages.append({"role": "user", "content": user_message})
-        result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs, agent_label="main")
+        result = await self._run_turn(self._messages, self._main_sandbox, self._config, self._request_kwargs, agent_label="main")
         logger.info("[assistant] %s", result)
         return result
 
@@ -400,7 +407,7 @@ class AgentRuntime:
 
             logger.info("[user] %s", stripped)
             self._messages.append({"role": "user", "content": stripped})
-            result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs, agent_label="main")
+            result = await self._run_turn(self._messages, self._main_sandbox, self._config, self._request_kwargs, agent_label="main")
             logger.info("[assistant] %s", result)
             print(result)
             print()
