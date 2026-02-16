@@ -46,7 +46,7 @@ async def test_config_defaults():
         c.api_key_env_var == "OPENROUTER_API_KEY",
         c.system_prompt is None,
         c.sandbox_image == "arcgeneral:sandbox",
-        c.code_timeout == 420.0,
+        c.code_timeout == 3600.0,
         c.max_tool_rounds == 50,
         c.temperature is None,
     ]))
