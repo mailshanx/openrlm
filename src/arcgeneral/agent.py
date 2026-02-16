@@ -219,7 +219,7 @@ class AgentRuntime:
         compressed.extend(full_history[last_user_idx:])
         return compressed
 
-    async def _run_turn(self, client: OpenRouter, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict) -> str:
+    async def _run_turn(self, client: OpenRouter, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main") -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
         for round_num in range(config.max_tool_rounds):
             compressed = self._compress_messages(full_history)
@@ -231,9 +231,9 @@ class AgentRuntime:
             choice = response.choices[0]
             msg = choice.message
             u = response.usage
-            logger.info("[model=%s finish=%s tokens=%s]", response.model, choice.finish_reason, f"{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}" if u else "?")
+            logger.info("[%s] [model=%s finish=%s tokens=%s]", agent_label, response.model, choice.finish_reason, f"{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}" if u else "?")
             if msg.content:
-                logger.info("[LLM] %s", msg.content)
+                logger.info("[%s] [LLM] %s", agent_label, msg.content)
             if msg.tool_calls:
                 for tc in msg.tool_calls:
                     raw_args = tc.function.arguments or "{}"
@@ -241,7 +241,7 @@ class AgentRuntime:
                         args_pretty = json.loads(raw_args).get("code", raw_args)
                     except (json.JSONDecodeError, AttributeError):
                         args_pretty = raw_args
-                    logger.info("[tool call] %s:\n%s", tc.function.name, args_pretty)
+                    logger.info("[%s] [tool call] %s:\n%s", agent_label, tc.function.name, args_pretty)
 
             # Convert to dict for round-tripping back into messages
             assistant_msg = {"role": "assistant"}
@@ -274,8 +274,7 @@ class AgentRuntime:
                     limit_bytes=config.output_limit_bytes,
                     host_downloads_dir=self._host_downloads_dir,
                 )
-                preview = result[:200] + '...' if len(result) > 1000 else result
-                logger.info("[tool result] %s", preview)
+                logger.info("[%s] [tool result] %s", agent_label, result)
                 full_history.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -329,7 +328,7 @@ class AgentRuntime:
 
         logger.info("[runtime] Running task on sub-agent %s: %s", agent_id, task[:100])
         sub.messages.append({"role": "user", "content": task})
-        result = await self._run_turn(sub.client, sub.messages, sub.sandbox, self._config, sub.request_kwargs)
+        result = await self._run_turn(sub.client, sub.messages, sub.sandbox, self._config, sub.request_kwargs, agent_label=agent_id)
         logger.info("[runtime] Sub-agent %s finished", agent_id)
         return result
 
@@ -339,7 +338,7 @@ class AgentRuntime:
         """Run the agent loop for a single message. Returns the final text response."""
         logger.info("[user] %s", user_message)
         self._messages.append({"role": "user", "content": user_message})
-        result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
+        result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs, agent_label="main")
         logger.info("[assistant] %s", result)
         return result
 
@@ -361,7 +360,7 @@ class AgentRuntime:
 
             logger.info("[user] %s", stripped)
             self._messages.append({"role": "user", "content": stripped})
-            result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
+            result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs, agent_label="main")
             logger.info("[assistant] %s", result)
             print(result)
             print()

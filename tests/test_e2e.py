@@ -46,7 +46,7 @@ async def test_config_defaults():
         c.api_key_env_var == "OPENROUTER_API_KEY",
         c.system_prompt is None,
         c.sandbox_image == "arcgeneral:sandbox",
-        c.code_timeout == 120.0,
+        c.code_timeout == 420.0,
         c.max_tool_rounds == 50,
         c.temperature is None,
     ]))
@@ -122,7 +122,7 @@ async def test_cli_parse_defaults():
         report("cli_default_model", isinstance(args.model, str) and len(args.model) > 0)
         report("cli_default_api_key_env", args.api_key_env_var == "OPENROUTER_API_KEY")
         report("cli_default_image", args.image == "arcgeneral:sandbox")
-        report("cli_default_timeout", args.timeout == 120.0)
+        report("cli_default_timeout", args.timeout == 420.0)
         report("cli_default_max_rounds", args.max_rounds == 50)
         report("cli_default_env_file", args.env_file == ".env")
         report("cli_default_verbose", args.verbose is False)
