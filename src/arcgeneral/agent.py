@@ -38,7 +38,8 @@ code — never as separate tool calls.
 2. Variables, imports, and function definitions persist across python tool calls.
 3. If code fails, read the traceback, fix the issue, and retry.
 4. For large outputs, summarize rather than dumping raw data.
-5. Files saved to `/app/downloads/` are accessible on the host machine's ~/Downloads folder.\
+5. Use `asyncio.gather()` to parallelize independent searches and fetches within a single step.
+6. Files saved to `/app/downloads/` are accessible on the host machine's ~/Downloads folder.\
 """
 
 
@@ -90,7 +91,7 @@ async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config
                 tc.function.arguments or "{}",
                 timeout=config.code_timeout,
             )
-            preview = result[:1000] + '...' if len(result) > 1000 else result
+            preview = result[:200] + '...' if len(result) > 1000 else result
             print(f"[tool result] {preview}")
             messages.append({
                 "role": "tool",
