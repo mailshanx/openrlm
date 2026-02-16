@@ -267,7 +267,7 @@ class AgentRuntime:
             except Exception as e:
                 if attempt == max_attempts - 1:
                     raise
-                wait = 2 ** attempt
+                wait = min(2 ** attempt, 10)
                 logger.warning("LLM call failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_attempts, wait, e)
                 await asyncio.sleep(wait)
 
