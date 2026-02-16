@@ -51,15 +51,27 @@ code \u2014 never as separate tool calls.
 7. To save context space, only your latest user message and its tool interactions are shown in full — earlier exchanges are condensed to user message + final response. Your complete history including all tool calls, outputs, and errors is available as `_conversation_history` — a list of message dicts (role, content, and optionally tool_calls or tool_call_id), updated after each step.
 
 ### Scaling with Sub-agents
-Each code execution returns at most 2000 lines of output and times out after 7 minutes. \
-To handle larger workloads, delegate to sub-agents:
-path shown in the truncation message). To handle larger workloads, delegate to sub-agents:
-- `agent_id = await create_agent(instructions='...')` — creates an agent with its own Python environment
-- `result = await run_agent(agent_id=agent_id, task='...')` — dispatches a task, returns the final response
-- Run multiple tasks in parallel: `await asyncio.gather(run_agent(...), run_agent(...))`
-- Sub-agents share `/app/downloads/` — use files to pass data between agents.
-- The `instructions` parameter is appended to the agent's system prompt — use it for role, \
-expertise, and constraints. Use `task` for the actual work.
+You work in a loop, one code block at a time. Each code execution returns at most 2000 lines
+of output and times out after 7 minutes. Sub-agents break through these limits — each runs in
+its own environment with its own limits, working in the background while you continue:
+
+- agent_id = await create_agent(instructions='...') — creates a sub-agent with its own Python environment
+- task_id = await run_agent(agent_id=agent_id, task='...') — starts a task in the background, returns immediately
+- result = await await_result(task_id) — blocks until the task finishes, returns the final response
+
+run_agent is non-blocking — the sub-agent works in the background while your code continues.
+Submit all tasks first, do your own work, then collect results across multiple steps:
+
+  a = await create_agent(instructions='citation specialist')
+  b = await create_agent(instructions='judicial historian')
+  t1 = await run_agent(agent_id=a, task='research citation percentiles')
+  t2 = await run_agent(agent_id=b, task='compile judge case histories')
+
+Then continue your own work — sub-agents are running in the background. When ready:
+
+  r1, r2 = await asyncio.gather(await_result(t1), await_result(t2))
+
+- Sub-agents share /app/downloads/ — use files to pass large data between agents.
 - Principle of Monotonicity: a sub-agent's task MUST be strictly simpler than your own — delegate proper subtasks, never your entire goal.
 """
 
@@ -67,10 +79,11 @@ expertise, and constraints. Use `task` for the actual work.
 @dataclass
 class _SubAgent:
     """State for a sub-agent created by the main agent."""
-    sandbox: Sandbox
-    messages: list
-    request_kwargs: dict
+    instructions: str
     depth: int
+    sandbox: Sandbox | None = None
+    messages: list | None = None
+    request_kwargs: dict | None = None
 
 
 class AgentRuntime:
@@ -80,7 +93,7 @@ class AgentRuntime:
         self._config = config
         self._registry = registry
         self._sub_agents: dict[str, _SubAgent] = {}
-        self._inflight_tasks: set[asyncio.Task] = set()
+        self._running_tasks: dict[str, asyncio.Task] = {}
         self._http_client: httpx.AsyncClient | None = None
         self._server: HostFunctionServer | None = None
         self._main_sandbox: Sandbox | None = None
@@ -111,10 +124,17 @@ class AgentRuntime:
             "run_agent",
             self._host_run_agent,
             description=(
-                "Run a task on a previously created sub-agent. "
-                "The sub-agent executes in its own environment with its own state. "
-                "Conversation history persists across calls to the same agent_id. "
-                "Returns the sub-agent's final text response."
+                "Start a task on a previously created sub-agent. "
+                "Returns a task_id immediately — the sub-agent runs in the background. "
+                "Use await_result(task_id) to collect the result."
+            ),
+        )
+        registry.register(
+            "await_result",
+            self._host_await_result,
+            description=(
+                "Block until a background task completes and return the result. "
+                "Pass the task_id returned by run_agent."
             ),
             timeout=None,
         )
@@ -146,19 +166,20 @@ class AgentRuntime:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Cancel in-flight host function tasks before killing sandboxes
-        for t in list(self._inflight_tasks):
+        # Cancel running background tasks before killing sandboxes
+        for task_id, t in list(self._running_tasks.items()):
             t.cancel()
-        if self._inflight_tasks:
-            await asyncio.gather(*self._inflight_tasks, return_exceptions=True)
-        self._inflight_tasks.clear()
+        if self._running_tasks:
+            await asyncio.gather(*self._running_tasks.values(), return_exceptions=True)
+        self._running_tasks.clear()
 
-        # Kill all sub-agent sandboxes
+        # Kill all sub-agent sandboxes (only those that were started)
         for agent_id, sub in list(self._sub_agents.items()):
-            try:
-                await sub.sandbox.__aexit__(None, None, None)
-            except Exception:
-                logger.warning("Failed to kill sub-agent %s sandbox", agent_id, exc_info=True)
+            if sub.sandbox is not None:
+                try:
+                    await sub.sandbox.__aexit__(None, None, None)
+                except Exception:
+                    logger.warning("Failed to kill sub-agent %s sandbox", agent_id, exc_info=True)
         self._sub_agents.clear()
 
         # Kill main sandbox
@@ -339,56 +360,67 @@ class AgentRuntime:
     # ── Host functions (called from kernel via HTTP bridge) ──
 
     async def _host_create_agent(self, instructions: str, _caller_id: str = "main") -> str:
-        """Create a sub-agent. Returns agent_id."""
+        """Create a sub-agent. Returns agent_id. Sandbox is created lazily on first run_agent."""
         # Look up calling agent's depth
         caller_sub = self._sub_agents.get(_caller_id)
         depth = caller_sub.depth if caller_sub else 0
         if depth >= self._config.max_sub_agent_depth:
             raise RuntimeError(f"Max sub-agent depth ({self._config.max_sub_agent_depth}) exceeded")
-
-        agent_id = uuid.uuid4().hex[:12]
-        logger.info("[runtime] Creating sub-agent %s (caller=%s, depth=%d)", agent_id, _caller_id, depth + 1)
-
-        sandbox = Sandbox(
+        logger.info("[runtime] Registered sub-agent %s (caller=%s, depth=%d)", agent_id, _caller_id, depth + 1)
+        self._sub_agents[agent_id] = _SubAgent(
+            instructions=instructions,
+            depth=depth + 1,
+        )
+        return agent_id
+    async def _ensure_sandbox(self, agent_id: str, sub: _SubAgent) -> None:
+        """Lazily create sandbox and init messages on first use."""
+        if sub.sandbox is not None:
+            return
+        logger.info("[runtime] Starting sandbox for sub-agent %s", agent_id)
+        sub.sandbox = Sandbox(
             tag=self._config.sandbox_image,
             binds=self._config.sandbox_binds,
             host_function_server=self._server,
         )
-        await sandbox.__aenter__()
-        await self._inject_agent_id(sandbox, agent_id)
-
-        messages, request_kwargs = self._init_messages(
+        await sub.sandbox.__aenter__()
+        await self._inject_agent_id(sub.sandbox, agent_id)
+        sub.messages, sub.request_kwargs = self._init_messages(
             self._config,
-            extra_instructions=instructions,
+            extra_instructions=sub.instructions,
         )
-        self._sub_agents[agent_id] = _SubAgent(
-            sandbox=sandbox,
-            messages=messages,
-            request_kwargs=request_kwargs,
-            depth=depth + 1,
-        )
-
-        logger.info("[runtime] Sub-agent %s ready (depth=%d)", agent_id, depth + 1)
-        return agent_id
+        logger.info("[runtime] Sub-agent %s ready", agent_id)
 
     async def _host_run_agent(self, agent_id: str, task: str) -> str:
-        """Run a task on a sub-agent. Returns the final text response."""
-        current = asyncio.current_task()
-        if current is not None:
-            self._inflight_tasks.add(current)
-        try:
-            sub = self._sub_agents.get(agent_id)
-            if sub is None:
-                raise RuntimeError(f"Unknown agent_id: {agent_id}")
+        """Start a task on a sub-agent. Returns task_id immediately."""
+        sub = self._sub_agents.get(agent_id)
+        if sub is None:
+            raise RuntimeError(f"Unknown agent_id: {agent_id}")
+        task_id = uuid.uuid4().hex[:12]
+        logger.info("[runtime] Starting task %s on sub-agent %s: %s", task_id, agent_id, task[:100])
 
-            logger.info("[runtime] Running task on sub-agent %s: %s", agent_id, task[:100])
-            sub.messages.append({"role": "user", "content": task})
-            result = await self._run_turn(sub.messages, sub.sandbox, self._config, sub.request_kwargs, agent_label=agent_id)
-            logger.info("[runtime] Sub-agent %s finished", agent_id)
-            return result
+        async def _execute():
+            try:
+                await self._ensure_sandbox(agent_id, sub)
+                sub.messages.append({"role": "user", "content": task})
+                result = await self._run_turn(sub.messages, sub.sandbox, self._config, sub.request_kwargs, agent_label=agent_id)
+                logger.info("[runtime] Task %s on sub-agent %s finished", task_id, agent_id)
+                return result
+            except asyncio.CancelledError:
+                logger.info("[runtime] Task %s on sub-agent %s cancelled", task_id, agent_id)
+                raise
+
+        self._running_tasks[task_id] = asyncio.create_task(_execute())
+        return task_id
+
+    async def _host_await_result(self, task_id: str) -> str:
+        """Block until a background task completes. Returns the final text response."""
+        task = self._running_tasks.get(task_id)
+        if task is None:
+            raise RuntimeError(f"Unknown task_id: {task_id}")
+        try:
+            return await task
         finally:
-            if current is not None:
-                self._inflight_tasks.discard(current)
+            self._running_tasks.pop(task_id, None)
 
     # ── Public API ──
 
