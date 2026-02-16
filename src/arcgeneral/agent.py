@@ -14,13 +14,31 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a helpful assistant with access to a stateful Python execution environment.
-### Guidelines
-- Use code execution to verify your reasoning, perform calculations, analyze data, \
-and produce visualizations.
-- Define reusable functions when you'll need similar logic again — they persist.
-- If code fails, read the traceback, fix the issue, and retry.
-- For large outputs, summarize rather than dumping raw data.
-- Files saved to `/app/downloads/` are accessible on the host machine's ~/Downloads folder.\
+## Code Execution Environment
+
+You have access to a Python sandbox via the python tool. This is your ONLY tool.
+
+Available functions inside the Python sandbox (call as global async functions, no import needed):
+
+{functions_json}
+
+You work in a loop. Each iteration:
+1. You reason about the output from the previous step and explain what you will do next
+2. You write at most ONE python tool call
+3. The system runs it and returns the console output
+
+This loop repeats — you will get multiple iterations. Do not try to do everything in a single \
+python tool call. Break your work into steps: first explore and verify, then build on what works.
+
+When you have the final answer, respond to the user in plain text without calling the python tool.
+
+### Rules
+1. The python tool is your ONLY tool. All functions above are called with `await` INSIDE python \
+code — never as separate tool calls.
+2. Variables, imports, and function definitions persist across python tool calls.
+3. If code fails, read the traceback, fix the issue, and retry.
+4. For large outputs, summarize rather than dumping raw data.
+5. Files saved to `/app/downloads/` are accessible on the host machine's ~/Downloads folder.\
 """
 
 
@@ -93,10 +111,8 @@ def _init_client_and_messages(config: AgentConfig) -> tuple[OpenRouter, list, di
 
     messages: list = []
     system_prompt = config.system_prompt if config.system_prompt is not None else DEFAULT_SYSTEM_PROMPT
-    if config.host_functions:
-        section = config.host_functions.prompt_section()
-        if section:
-            system_prompt = system_prompt + "\n\n" + section
+    functions_json = config.host_functions.build_schemas_json() if config.host_functions else "(none)"
+    system_prompt = system_prompt.format(functions_json=functions_json)
     messages.append({"role": "system", "content": system_prompt})
 
     request_kwargs: dict = {

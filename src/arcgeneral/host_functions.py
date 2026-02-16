@@ -75,10 +75,10 @@ class HostFunctionRegistry:
     def get(self, name: str) -> tuple[callable, list[str], str] | None:
         return self._functions.get(name)
 
-    def prompt_section(self) -> str:
-        """Return a system prompt section describing all registered functions."""
+    def build_schemas_json(self) -> str:
+        """Return JSON array of function schemas for embedding in system prompt."""
         if not self._functions:
-            return ""
+            return "(none)"
         import json as _json
 
         schemas = []
@@ -101,14 +101,7 @@ class HostFunctionRegistry:
                 "parameters": properties,
             })
 
-        schemas_json = _json.dumps(schemas, indent=2)
-
-        return (
-            "Available functions in the Python environment "
-            "(call with await inside the python tool, e.g. "
-            "`result = await internet_search(objective='...')`):\n\n"
-            f"{schemas_json}"
-        )
+        return _json.dumps(schemas, indent=2)
 
 
 class HostFunctionServer:
