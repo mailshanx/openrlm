@@ -21,9 +21,9 @@ You are a helpful assistant with access to a stateful Python execution environme
 
 ## Code Execution Environment
 
-You have access to a Python sandbox via the python tool. This is your ONLY tool.
+You have access to a Python environment via the python tool. This is your ONLY tool.
 
-Available functions inside the Python sandbox (call as global async functions, no import needed):
+Available functions inside the Python environment (call as global async functions, no import needed):
 
 {functions_json}
 
@@ -44,7 +44,15 @@ code \u2014 never as separate tool calls.
 3. If code fails, read the traceback, fix the issue, and retry.
 4. For large outputs, summarize rather than dumping raw data.
 5. Use `asyncio.gather()` to parallelize independent searches and fetches within a single step.
-6. Files saved to `/app/downloads/` are accessible on the host machine's ~/Downloads folder.\
+6. Files saved to `/app/downloads/` are accessible on the host machine's ~/Downloads folder.
+
+### Scaling with Sub-agents
+Each code execution returns at most 2000 lines of output (the full output is saved to a file \
+path shown in the truncation message). To handle larger workloads, delegate to sub-agents:
+- `agent_id = await create_agent(instructions='...')` — creates an agent with its own Python environment
+- `result = await run_agent(agent_id=agent_id, task='...')` — dispatches a task, returns the final response
+- Run multiple tasks in parallel: `await asyncio.gather(run_agent(...), run_agent(...))`
+- Sub-agents share `/app/downloads/` — use files to pass data between agents.\
 """
 
 
@@ -84,7 +92,7 @@ class AgentRuntime:
             "create_agent",
             self._host_create_agent,
             description=(
-                "Create a sub-agent with its own Python sandbox. "
+                "Create a sub-agent with its own Python environment. "
                 "The sub-agent has the same capabilities and functions as you, "
                 "plus any additional instructions you provide. "
                 "Returns an agent_id string to use with run_agent."
@@ -95,7 +103,7 @@ class AgentRuntime:
             self._host_run_agent,
             description=(
                 "Run a task on a previously created sub-agent. "
-                "The sub-agent executes in its own sandbox with its own state. "
+                "The sub-agent executes in its own environment with its own state. "
                 "Conversation history persists across calls to the same agent_id. "
                 "Returns the sub-agent's final text response."
             ),
