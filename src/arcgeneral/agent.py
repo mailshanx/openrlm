@@ -61,7 +61,10 @@ async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config
         if msg.tool_calls:
             for tc in msg.tool_calls:
                 raw_args = tc.function.arguments or "{}"
-                args_pretty = json.loads(raw_args).get("code", raw_args)
+                try:
+                    args_pretty = json.loads(raw_args).get("code", raw_args)
+                except (json.JSONDecodeError, AttributeError):
+                    args_pretty = raw_args
                 print(f"[tool call] {tc.function.name}:\n{args_pretty}")
 
         # Convert to dict for round-tripping back into messages

@@ -32,7 +32,10 @@ async def execute_tool(sandbox: Sandbox, name: str, arguments: str, timeout: flo
     """Dispatch a tool call. Returns the result string."""
     if name != "python":
         return f"Unknown tool: {name}"
-    args = json.loads(arguments)
+    try:
+        args = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return f"Error: invalid tool call arguments: {arguments!r}"
     code = args.get("code")
     if not code:
         return "Error: no code provided in tool call arguments."
