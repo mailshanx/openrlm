@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Self
 
 from openrouter import OpenRouter
+from openrouter.errors import OpenRouterError
 
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
@@ -15,6 +17,9 @@ from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
 
 
 logger = logging.getLogger(__name__)
+
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 524, 529}
+_MAX_LLM_RETRIES = 5
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a helpful assistant with access to a stateful Python execution environment.
@@ -77,6 +82,7 @@ class AgentRuntime:
         self._config = config
         self._registry = registry
         self._sub_agents: dict[str, _SubAgent] = {}
+        self._inflight_tasks: set[asyncio.Task] = set()
         self._server: HostFunctionServer | None = None
         self._main_sandbox: Sandbox | None = None
         self._client: OpenRouter | None = None
@@ -127,11 +133,21 @@ class AgentRuntime:
         )
         await self._main_sandbox.__aenter__()
 
+        # Inject agent identity for depth tracking
+        await self._inject_agent_id(self._main_sandbox, "main")
+
         # Init LLM client and messages
         self._client, self._messages, self._request_kwargs = self._make_client_and_messages(self._config)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Cancel in-flight host function tasks before killing sandboxes
+        for t in list(self._inflight_tasks):
+            t.cancel()
+        if self._inflight_tasks:
+            await asyncio.gather(*self._inflight_tasks, return_exceptions=True)
+        self._inflight_tasks.clear()
+
         # Kill all sub-agent sandboxes
         for agent_id, sub in list(self._sub_agents.items()):
             try:
@@ -183,6 +199,20 @@ class AgentRuntime:
 
         return client, messages, request_kwargs
 
+    async def _inject_agent_id(self, sandbox: Sandbox, agent_id: str) -> None:
+        """Inject _AGENT_ID and rewrap create_agent to pass it automatically for depth tracking."""
+        code = (
+            f"_AGENT_ID = {agent_id!r}\n"
+            "if 'create_agent' in dir():\n"
+            "    _original_create_agent = create_agent\n"
+            "    async def create_agent(instructions):\n"
+            "        return await _original_create_agent(instructions=instructions, _caller_id=_AGENT_ID)\n"
+        )
+        try:
+            await sandbox.execute(code, timeout=10.0)
+        except Exception:
+            logger.debug("Failed to inject agent ID %s", agent_id, exc_info=True)
+
     async def _sync_history(self, sandbox: Sandbox, messages: list) -> None:
         """Push the full conversation history into the kernel as _conversation_history."""
         try:
@@ -219,14 +249,29 @@ class AgentRuntime:
         compressed.extend(full_history[last_user_idx:])
         return compressed
 
+    async def _llm_call_with_retry(self, client: OpenRouter, compressed: list, request_kwargs: dict, agent_label: str):
+        """Call the LLM with retry on transient errors."""
+        for attempt in range(_MAX_LLM_RETRIES + 1):
+            try:
+                return await client.chat.send_async(
+                    messages=compressed,
+                    **request_kwargs,
+                )
+            except OpenRouterError as e:
+                if e.status_code not in _RETRYABLE_STATUS_CODES or attempt == _MAX_LLM_RETRIES:
+                    raise
+                wait = 2 ** attempt
+                logger.warning(
+                    "[%s] Retryable LLM error (HTTP %d), attempt %d/%d, waiting %ds: %s",
+                    agent_label, e.status_code, attempt + 1, _MAX_LLM_RETRIES, wait, e,
+                )
+                await asyncio.sleep(wait)
+
     async def _run_turn(self, client: OpenRouter, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main") -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
         for round_num in range(config.max_tool_rounds):
             compressed = self._compress_messages(full_history)
-            response = await client.chat.send_async(
-                messages=compressed,
-                **request_kwargs,
-            )
+            response = await self._llm_call_with_retry(client, compressed, request_kwargs, agent_label)
 
             choice = response.choices[0]
             msg = choice.message
@@ -287,15 +332,16 @@ class AgentRuntime:
 
     # ── Host functions (called from kernel via HTTP bridge) ──
 
-    async def _host_create_agent(self, instructions: str) -> str:
+    async def _host_create_agent(self, instructions: str, _caller_id: str = "main") -> str:
         """Create a sub-agent. Returns agent_id."""
-        # Depth tracking: main agent calls are depth 0
-        depth = 0  # TODO: track calling agent's depth for recursive sub-agents
+        # Look up calling agent's depth
+        caller_sub = self._sub_agents.get(_caller_id)
+        depth = caller_sub.depth if caller_sub else 0
         if depth >= self._config.max_sub_agent_depth:
             raise RuntimeError(f"Max sub-agent depth ({self._config.max_sub_agent_depth}) exceeded")
 
         agent_id = uuid.uuid4().hex[:12]
-        logger.info("[runtime] Creating sub-agent %s", agent_id)
+        logger.info("[runtime] Creating sub-agent %s (caller=%s, depth=%d)", agent_id, _caller_id, depth + 1)
 
         sandbox = Sandbox(
             tag=self._config.sandbox_image,
@@ -303,6 +349,7 @@ class AgentRuntime:
             host_function_server=self._server,
         )
         await sandbox.__aenter__()
+        await self._inject_agent_id(sandbox, agent_id)
 
         client, messages, request_kwargs = self._make_client_and_messages(
             self._config,
@@ -317,20 +364,27 @@ class AgentRuntime:
             depth=depth + 1,
         )
 
-        logger.info("[runtime] Sub-agent %s ready", agent_id)
+        logger.info("[runtime] Sub-agent %s ready (depth=%d)", agent_id, depth + 1)
         return agent_id
 
     async def _host_run_agent(self, agent_id: str, task: str) -> str:
         """Run a task on a sub-agent. Returns the final text response."""
-        sub = self._sub_agents.get(agent_id)
-        if sub is None:
-            raise RuntimeError(f"Unknown agent_id: {agent_id}")
+        current = asyncio.current_task()
+        if current is not None:
+            self._inflight_tasks.add(current)
+        try:
+            sub = self._sub_agents.get(agent_id)
+            if sub is None:
+                raise RuntimeError(f"Unknown agent_id: {agent_id}")
 
-        logger.info("[runtime] Running task on sub-agent %s: %s", agent_id, task[:100])
-        sub.messages.append({"role": "user", "content": task})
-        result = await self._run_turn(sub.client, sub.messages, sub.sandbox, self._config, sub.request_kwargs, agent_label=agent_id)
-        logger.info("[runtime] Sub-agent %s finished", agent_id)
-        return result
+            logger.info("[runtime] Running task on sub-agent %s: %s", agent_id, task[:100])
+            sub.messages.append({"role": "user", "content": task})
+            result = await self._run_turn(sub.client, sub.messages, sub.sandbox, self._config, sub.request_kwargs, agent_label=agent_id)
+            logger.info("[runtime] Sub-agent %s finished", agent_id)
+            return result
+        finally:
+            if current is not None:
+                self._inflight_tasks.discard(current)
 
     # ── Public API ──
 
