@@ -59,7 +59,8 @@ path shown in the truncation message). To handle larger workloads, delegate to s
 - Run multiple tasks in parallel: `await asyncio.gather(run_agent(...), run_agent(...))`
 - Sub-agents share `/app/downloads/` — use files to pass data between agents.
 - The `instructions` parameter is appended to the agent's system prompt — use it for role, \
-expertise, and constraints. Use `task` for the actual work.\
+expertise, and constraints. Use `task` for the actual work.
+- Principle of Monotonicity: a sub-agent's task MUST be strictly simpler than your own — delegate proper subtasks, never your entire goal.
 """
 
 
