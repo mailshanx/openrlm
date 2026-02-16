@@ -231,9 +231,9 @@ class AgentRuntime:
             choice = response.choices[0]
             msg = choice.message
             u = response.usage
-            print(f"[model={response.model} finish={choice.finish_reason} tokens={f'{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}' if u else '?'}]")
+            logger.info("[model=%s finish=%s tokens=%s]", response.model, choice.finish_reason, f"{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}" if u else "?")
             if msg.content:
-                print(f"[LLM] {msg.content}")
+                logger.info("[LLM] %s", msg.content)
             if msg.tool_calls:
                 for tc in msg.tool_calls:
                     raw_args = tc.function.arguments or "{}"
@@ -241,7 +241,7 @@ class AgentRuntime:
                         args_pretty = json.loads(raw_args).get("code", raw_args)
                     except (json.JSONDecodeError, AttributeError):
                         args_pretty = raw_args
-                    print(f"[tool call] {tc.function.name}:\n{args_pretty}")
+                    logger.info("[tool call] %s:\n%s", tc.function.name, args_pretty)
 
             # Convert to dict for round-tripping back into messages
             assistant_msg = {"role": "assistant"}
@@ -275,7 +275,7 @@ class AgentRuntime:
                     host_downloads_dir=self._host_downloads_dir,
                 )
                 preview = result[:200] + '...' if len(result) > 1000 else result
-                print(f"[tool result] {preview}")
+                logger.info("[tool result] %s", preview)
                 full_history.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -296,7 +296,7 @@ class AgentRuntime:
             raise RuntimeError(f"Max sub-agent depth ({self._config.max_sub_agent_depth}) exceeded")
 
         agent_id = uuid.uuid4().hex[:12]
-        print(f"[runtime] Creating sub-agent {agent_id}")
+        logger.info("[runtime] Creating sub-agent %s", agent_id)
 
         sandbox = Sandbox(
             tag=self._config.sandbox_image,
@@ -318,7 +318,7 @@ class AgentRuntime:
             depth=depth + 1,
         )
 
-        print(f"[runtime] Sub-agent {agent_id} ready")
+        logger.info("[runtime] Sub-agent %s ready", agent_id)
         return agent_id
 
     async def _host_run_agent(self, agent_id: str, task: str) -> str:
@@ -327,10 +327,10 @@ class AgentRuntime:
         if sub is None:
             raise RuntimeError(f"Unknown agent_id: {agent_id}")
 
-        print(f"[runtime] Running task on sub-agent {agent_id}: {task[:100]}")
+        logger.info("[runtime] Running task on sub-agent %s: %s", agent_id, task[:100])
         sub.messages.append({"role": "user", "content": task})
         result = await self._run_turn(sub.client, sub.messages, sub.sandbox, self._config, sub.request_kwargs)
-        print(f"[runtime] Sub-agent {agent_id} finished")
+        logger.info("[runtime] Sub-agent %s finished", agent_id)
         return result
 
     # ── Public API ──
@@ -357,5 +357,6 @@ class AgentRuntime:
                 continue
 
             self._messages.append({"role": "user", "content": stripped})
-            await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
+            result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
+            print(result)
             print()

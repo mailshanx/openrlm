@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, default=50, help="Max tool loop iterations")
     parser.add_argument("--env-file", type=str, default=".env", help="Path to .env file")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("--log-file", type=str, default=str(Path.home() / "Downloads" / "arcgeneral.log"), help="Log file path")
     return parser.parse_args()
 
 
@@ -29,10 +30,15 @@ def main():
     args = parse_args()
 
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
+        level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    logging.getLogger("arcgeneral").setLevel(logging.INFO)
+    arc_logger = logging.getLogger("arcgeneral")
+    arc_logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    file_handler = logging.FileHandler(args.log_file, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    arc_logger.addHandler(file_handler)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
