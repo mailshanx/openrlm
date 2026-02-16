@@ -45,6 +45,7 @@ code \u2014 never as separate tool calls.
 4. For large outputs, summarize rather than dumping raw data.
 5. Use `asyncio.gather()` to parallelize independent searches and fetches within a single step.
 6. Files saved to `/app/downloads/` are accessible on the host machine's ~/Downloads folder.
+7. Your conversation history is available as `_conversation_history` — a list of `{"role": "user"|"assistant"|"tool", "content": "..."}` dicts containing the full conversation including tool outputs and errors, updated after each step.
 
 ### Scaling with Sub-agents
 Each code execution returns at most 2000 lines of output (the full output is saved to a file \
