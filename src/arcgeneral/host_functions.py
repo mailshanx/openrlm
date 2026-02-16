@@ -79,24 +79,36 @@ class HostFunctionRegistry:
         """Return a system prompt section describing all registered functions."""
         if not self._functions:
             return ""
-        lines = ["## Built-in functions", "",
-                 "The following async functions are available in the Python environment. "
-                 "To use them, call the python tool with code that awaits them.",
-                 ""]
+        import json as _json
+
+        schemas = []
         for name, (fn, param_names, description) in self._functions.items():
             sig = inspect.signature(fn)
-            params = []
+            properties = {}
+            required = []
             for pname, param in sig.parameters.items():
+                prop: dict = {"type": "string"}
+                if param.annotation is bool:
+                    prop = {"type": "boolean"}
                 if param.default is inspect.Parameter.empty:
-                    params.append(pname)
+                    required.append(pname)
                 else:
-                    params.append(f"{pname}={param.default!r}")
-            sig_str = ", ".join(params)
-            lines.append(f"### `await {name}({sig_str})`")
-            if description:
-                lines.append(description)
-            lines.append("")
-        return "\n".join(lines)
+                    prop["default"] = param.default
+                properties[pname] = prop
+            schemas.append({
+                "name": name,
+                "description": description,
+                "parameters": properties,
+            })
+
+        schemas_json = _json.dumps(schemas, indent=2)
+
+        return (
+            "Available functions in the Python environment "
+            "(call with await inside the python tool, e.g. "
+            "`result = await internet_search(objective='...')`):\n\n"
+            f"{schemas_json}"
+        )
 
 
 class HostFunctionServer:

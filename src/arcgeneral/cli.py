@@ -15,7 +15,7 @@ from arcgeneral.internet_search import execute_internet_search
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LLM agent with stateful IPython REPL")
     parser.add_argument("message", type=str, nargs="?", default=None, help="User message (omit for interactive session)")
-    parser.add_argument("--model", type=str, default="qwen/qwen3-coder-next", help="Model name")
+    parser.add_argument("--model", type=str, default="minimax/minimax-m2.5", help="Model name")
     parser.add_argument("--api-key-env-var", type=str, default="OPENROUTER_API_KEY", help="Env var name for API key")
     parser.add_argument("--image", type=str, default="arcgeneral:sandbox", help="Docker image tag for sandbox")
     parser.add_argument("--timeout", type=float, default=120.0, help="Code execution timeout in seconds")
