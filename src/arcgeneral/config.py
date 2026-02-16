@@ -13,7 +13,7 @@ class AgentConfig:
     api_key_env_var: str = "OPENROUTER_API_KEY"
     system_prompt: str | None = None
     sandbox_image: str = "arcgeneral:sandbox"
-    code_timeout: float = 120.0
+    code_timeout: float = 420.0
     max_tool_rounds: int = 50
     max_sub_agent_depth: int = 10
     output_limit_lines: int = 2000

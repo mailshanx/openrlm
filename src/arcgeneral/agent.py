@@ -48,7 +48,7 @@ code \u2014 never as separate tool calls.
 7. To save context space, only your latest user message and its tool interactions are shown in full — earlier exchanges are condensed to user message + final response. Your complete history including all tool calls, outputs, and errors is available as `_conversation_history` — a list of message dicts (role, content, and optionally tool_calls or tool_call_id), updated after each step.
 
 ### Scaling with Sub-agents
-Each code execution returns at most 2000 lines of output and times out after 120 seconds. \
+Each code execution returns at most 2000 lines of output and times out after 7 minutes. \
 To handle larger workloads, delegate to sub-agents:
 path shown in the truncation message). To handle larger workloads, delegate to sub-agents:
 - `agent_id = await create_agent(instructions='...')` — creates an agent with its own Python environment

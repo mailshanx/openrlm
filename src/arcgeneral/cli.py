@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default="z-ai/glm-5", help="Model name")
     parser.add_argument("--api-key-env-var", type=str, default="OPENROUTER_API_KEY", help="Env var name for API key")
     parser.add_argument("--image", type=str, default="arcgeneral:sandbox", help="Docker image tag for sandbox")
-    parser.add_argument("--timeout", type=float, default=120.0, help="Code execution timeout in seconds")
+    parser.add_argument("--timeout", type=float, default=420.0, help="Code execution timeout in seconds")
     parser.add_argument("--max-rounds", type=int, default=50, help="Max tool loop iterations")
     parser.add_argument("--env-file", type=str, default=".env", help="Path to .env file")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
