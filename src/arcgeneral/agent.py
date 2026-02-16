@@ -256,11 +256,20 @@ class AgentRuntime:
         return compressed
 
     async def _llm_call(self, messages: list, request_kwargs: dict):
-        """Single LLM call. Separated for easy extension with retry logic."""
-        return await self._client.chat.send_async(
-            messages=messages,
-            **request_kwargs,
-        )
+        """LLM call with retry on transient errors (4 attempts, exponential backoff)."""
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                return await self._client.chat.send_async(
+                    messages=messages,
+                    **request_kwargs,
+                )
+            except Exception as e:
+                if attempt == max_attempts - 1:
+                    raise
+                wait = 2 ** attempt
+                logger.warning("LLM call failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_attempts, wait, e)
+                await asyncio.sleep(wait)
 
     async def _run_turn(self, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main") -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
