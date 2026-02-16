@@ -3,7 +3,7 @@ import logging
 
 import aiohttp
 from ipybox import ExecutionClient, ExecutionContainer, ExecutionError
-from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
+from arcgeneral.host_functions import HostFunctionServer
 from typing import Self
 
 
@@ -83,22 +83,23 @@ class _Container(ExecutionContainer):
 class Sandbox:
     """Manages Docker container + IPython kernel lifecycle.
 
-    Automatically reconnects when the kernel dies mid-session. Kernel state
-    is lost on reconnect but the session continues.
+    The host function server is managed externally (by AgentRuntime).
+    Pass host_function_server to inject stubs into the kernel at startup.
     """
 
-    def __init__(self, tag: str = "arcgeneral:sandbox", binds: dict[str, str] | None = None, host_functions: HostFunctionRegistry | None = None):
+    def __init__(
+        self,
+        tag: str = "arcgeneral:sandbox",
+        binds: dict[str, str] | None = None,
+        host_function_server: HostFunctionServer | None = None,
+    ):
         self._tag = tag
         self._binds = binds or {}
         self._container: _Container | None = None
         self._client: ExecutionClient | None = None
-        self._host_functions = host_functions
-        self._host_server: HostFunctionServer | None = None
+        self._host_function_server = host_function_server
 
     async def __aenter__(self) -> Self:
-        if self._host_functions and self._host_functions.names:
-            self._host_server = HostFunctionServer(self._host_functions)
-            await self._host_server.__aenter__()
         self._container = _Container(tag=self._tag, binds=self._binds)
         await self._container.__aenter__()
         self._client = ExecutionClient(port=self._container.executor_port)
@@ -121,18 +122,11 @@ class Sandbox:
                 logger.warning("Failed to kill ExecutionContainer", exc_info=True)
             finally:
                 self._container = None
-        if self._host_server is not None:
-            try:
-                await self._host_server.__aexit__(exc_type, exc_val, exc_tb)
-            except Exception:
-                logger.warning("Failed to stop HostFunctionServer", exc_info=True)
-            finally:
-                self._host_server = None
 
     async def _run_preamble(self) -> None:
         """Execute host function stubs + KERNEL_PREAMBLE cells in the kernel."""
-        if self._host_server is not None:
-            code = self._host_server.preamble_code()
+        if self._host_function_server is not None:
+            code = self._host_function_server.preamble_code()
             logger.info("Injecting host function stubs into kernel")
             await self._client.execute(code=code, timeout=30.0)
         for cell in KERNEL_PREAMBLE:

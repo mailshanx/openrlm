@@ -1,12 +1,15 @@
 import logging
 import json
 import os
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-import sys
+from typing import Self
 
 from openrouter import OpenRouter
 
 from arcgeneral.config import AgentConfig
+from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
 from arcgeneral.sandbox import Sandbox
 from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
 
@@ -15,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a helpful assistant with access to a stateful Python execution environment.
+
 ## Code Execution Environment
 
 You have access to a Python sandbox via the python tool. This is your ONLY tool.
@@ -28,14 +32,14 @@ You work in a loop. Each iteration:
 2. You write at most ONE python tool call
 3. The system runs it and returns the console output
 
-This loop repeats — you will get multiple iterations. Do not try to do everything in a single \
+This loop repeats \u2014 you will get multiple iterations. Do not try to do everything in a single \
 python tool call. Break your work into steps: first explore and verify, then build on what works.
 
 When you have the final answer, respond to the user in plain text without calling the python tool.
 
 ### Rules
 1. The python tool is your ONLY tool. All functions above are called with `await` INSIDE python \
-code — never as separate tool calls.
+code \u2014 never as separate tool calls.
 2. Variables, imports, and function definitions persist across python tool calls.
 3. If code fails, read the traceback, fix the issue, and retry.
 4. For large outputs, summarize rather than dumping raw data.
@@ -44,115 +48,249 @@ code — never as separate tool calls.
 """
 
 
-async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict) -> str:
-    """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
-    # Resolve host downloads dir from sandbox_binds for output spooling
-    host_downloads_dir = None
-    for host_path, container_name in config.sandbox_binds.items():
-        if container_name == "downloads":
-            host_downloads_dir = Path(host_path)
-            break
-    for round_num in range(config.max_tool_rounds):
+@dataclass
+class _SubAgent:
+    """State for a sub-agent created by the main agent."""
+    sandbox: Sandbox
+    client: OpenRouter
+    messages: list
+    request_kwargs: dict
+    depth: int
 
-        response = await client.chat.send_async(
-            messages=messages,
-            **request_kwargs,
+
+class AgentRuntime:
+    """Owns the session lifecycle: host function server, sandboxes, sub-agents, and the LLM loop."""
+
+    def __init__(self, config: AgentConfig, registry: HostFunctionRegistry):
+        self._config = config
+        self._registry = registry
+        self._sub_agents: dict[str, _SubAgent] = {}
+        self._server: HostFunctionServer | None = None
+        self._main_sandbox: Sandbox | None = None
+        self._client: OpenRouter | None = None
+        self._messages: list | None = None
+        self._request_kwargs: dict | None = None
+
+        # Resolve host downloads dir from sandbox_binds for output spooling
+        self._host_downloads_dir: Path | None = None
+        for host_path, container_name in config.sandbox_binds.items():
+            if container_name == "downloads":
+                self._host_downloads_dir = Path(host_path)
+                break
+
+        # Register runtime host functions into the registry (before server starts,
+        # so they appear in the system prompt and get kernel stubs).
+        registry.register(
+            "create_agent",
+            self._host_create_agent,
+            description=(
+                "Create a sub-agent with its own Python sandbox. "
+                "The sub-agent has the same capabilities and functions as you, "
+                "plus any additional instructions you provide. "
+                "Returns an agent_id string to use with run_agent."
+            ),
+        )
+        registry.register(
+            "run_agent",
+            self._host_run_agent,
+            description=(
+                "Run a task on a previously created sub-agent. "
+                "The sub-agent executes in its own sandbox with its own state. "
+                "Conversation history persists across calls to the same agent_id. "
+                "Returns the sub-agent's final text response."
+            ),
         )
 
-        choice = response.choices[0]
-        msg = choice.message
-        u = response.usage
-        print(f"[model={response.model} finish={choice.finish_reason} tokens={f'{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}' if u else '?'}]")
-        if msg.content:
-            print(f"[LLM] {msg.content}")
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                raw_args = tc.function.arguments or "{}"
-                try:
-                    args_pretty = json.loads(raw_args).get("code", raw_args)
-                except (json.JSONDecodeError, AttributeError):
-                    args_pretty = raw_args
-                print(f"[tool call] {tc.function.name}:\n{args_pretty}")
+    async def __aenter__(self) -> Self:
+        # Start shared host function server
+        if self._registry.names:
+            self._server = HostFunctionServer(self._registry)
+            await self._server.__aenter__()
 
-        # Convert to dict for round-tripping back into messages
-        assistant_msg = {"role": "assistant"}
-        assistant_msg["content"] = msg.content or None
-        if msg.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "{}",
-                    },
-                }
-                for tc in msg.tool_calls
-            ]
-        messages.append(assistant_msg)
+        # Start main sandbox
+        self._main_sandbox = Sandbox(
+            tag=self._config.sandbox_image,
+            binds=self._config.sandbox_binds,
+            host_function_server=self._server,
+        )
+        await self._main_sandbox.__aenter__()
 
-        if not msg.tool_calls:
-            return msg.content or ""
+        # Init LLM client and messages
+        self._client, self._messages, self._request_kwargs = self._make_client_and_messages(self._config)
+        return self
 
-        for tc in msg.tool_calls:
-            result = await execute_tool(
-                sandbox,
-                tc.function.name,
-                tc.function.arguments or "{}",
-                timeout=config.code_timeout,
-                limit_lines=config.output_limit_lines,
-                limit_bytes=config.output_limit_bytes,
-                host_downloads_dir=host_downloads_dir,
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Kill all sub-agent sandboxes
+        for agent_id, sub in list(self._sub_agents.items()):
+            try:
+                await sub.sandbox.__aexit__(None, None, None)
+            except Exception:
+                logger.warning("Failed to kill sub-agent %s sandbox", agent_id, exc_info=True)
+        self._sub_agents.clear()
+
+        # Kill main sandbox
+        if self._main_sandbox is not None:
+            try:
+                await self._main_sandbox.__aexit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                logger.warning("Failed to kill main sandbox", exc_info=True)
+            finally:
+                self._main_sandbox = None
+
+        # Stop host function server
+        if self._server is not None:
+            try:
+                await self._server.__aexit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                logger.warning("Failed to stop HostFunctionServer", exc_info=True)
+            finally:
+                self._server = None
+
+    def _make_client_and_messages(self, config: AgentConfig, extra_instructions: str | None = None) -> tuple[OpenRouter, list, dict]:
+        """Create an OpenRouter client, seed the messages list, and build request kwargs."""
+        api_key = os.environ.get(config.api_key_env_var)
+        if api_key is None:
+            raise ValueError(f"{config.api_key_env_var} is not set")
+
+        client = OpenRouter(api_key=api_key)
+
+        messages: list = []
+        system_prompt = config.system_prompt if config.system_prompt is not None else DEFAULT_SYSTEM_PROMPT
+        functions_json = self._registry.build_schemas_json()
+        system_prompt = system_prompt.format(functions_json=functions_json)
+        if extra_instructions:
+            system_prompt = system_prompt + "\n\n## Additional Instructions\n" + extra_instructions
+        messages.append({"role": "system", "content": system_prompt})
+
+        request_kwargs: dict = {
+            "model": config.model,
+            "tools": [PYTHON_TOOL_SCHEMA],
+        }
+        if config.temperature is not None:
+            request_kwargs["temperature"] = config.temperature
+
+        return client, messages, request_kwargs
+
+    async def _run_turn(self, client: OpenRouter, messages: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict) -> str:
+        """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
+        for round_num in range(config.max_tool_rounds):
+
+            response = await client.chat.send_async(
+                messages=messages,
+                **request_kwargs,
             )
-            preview = result[:200] + '...' if len(result) > 1000 else result
-            print(f"[tool result] {preview}")
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
 
-    return messages[-1].get("content", "") if isinstance(messages[-1], dict) else ""
+            choice = response.choices[0]
+            msg = choice.message
+            u = response.usage
+            print(f"[model={response.model} finish={choice.finish_reason} tokens={f'{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}' if u else '?'}]")
+            if msg.content:
+                print(f"[LLM] {msg.content}")
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    raw_args = tc.function.arguments or "{}"
+                    try:
+                        args_pretty = json.loads(raw_args).get("code", raw_args)
+                    except (json.JSONDecodeError, AttributeError):
+                        args_pretty = raw_args
+                    print(f"[tool call] {tc.function.name}:\n{args_pretty}")
 
+            # Convert to dict for round-tripping back into messages
+            assistant_msg = {"role": "assistant"}
+            assistant_msg["content"] = msg.content or None
+            if msg.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+            messages.append(assistant_msg)
 
-def _init_client_and_messages(config: AgentConfig) -> tuple[OpenRouter, list, dict]:
-    """Create the OpenRouter client, seed the messages list, and build request kwargs."""
-    api_key = os.environ.get(config.api_key_env_var)
-    if api_key is None:
-        raise ValueError(f"{config.api_key_env_var} is not set")
+            if not msg.tool_calls:
+                return msg.content or ""
 
-    client = OpenRouter(api_key=api_key)
+            for tc in msg.tool_calls:
+                result = await execute_tool(
+                    sandbox,
+                    tc.function.name,
+                    tc.function.arguments or "{}",
+                    timeout=config.code_timeout,
+                    limit_lines=config.output_limit_lines,
+                    limit_bytes=config.output_limit_bytes,
+                    host_downloads_dir=self._host_downloads_dir,
+                )
+                preview = result[:200] + '...' if len(result) > 1000 else result
+                print(f"[tool result] {preview}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
 
-    messages: list = []
-    system_prompt = config.system_prompt if config.system_prompt is not None else DEFAULT_SYSTEM_PROMPT
-    functions_json = config.host_functions.build_schemas_json() if config.host_functions else "(none)"
-    system_prompt = system_prompt.format(functions_json=functions_json)
-    messages.append({"role": "system", "content": system_prompt})
+        return messages[-1].get("content", "") if isinstance(messages[-1], dict) else ""
 
-    request_kwargs: dict = {
-        "model": config.model,
-        "tools": [PYTHON_TOOL_SCHEMA],
-    }
-    if config.temperature is not None:
-        request_kwargs["temperature"] = config.temperature
+    # ── Host functions (called from kernel via HTTP bridge) ──
 
-    return client, messages, request_kwargs
+    async def _host_create_agent(self, instructions: str) -> str:
+        """Create a sub-agent. Returns agent_id."""
+        # Depth tracking: main agent calls are depth 0
+        depth = 0  # TODO: track calling agent's depth for recursive sub-agents
+        if depth >= self._config.max_sub_agent_depth:
+            raise RuntimeError(f"Max sub-agent depth ({self._config.max_sub_agent_depth}) exceeded")
 
+        agent_id = uuid.uuid4().hex[:12]
+        print(f"[runtime] Creating sub-agent {agent_id}")
 
-async def run_agent(config: AgentConfig, user_message: str) -> str:
-    """Run the agent loop for a single message. Returns the final text response."""
-    client, messages, request_kwargs = _init_client_and_messages(config)
-    messages.append({"role": "user", "content": user_message})
+        sandbox = Sandbox(
+            tag=self._config.sandbox_image,
+            binds=self._config.sandbox_binds,
+            host_function_server=self._server,
+        )
+        await sandbox.__aenter__()
 
-    async with Sandbox(tag=config.sandbox_image, binds=config.sandbox_binds, host_functions=config.host_functions) as sandbox:
-        return await _run_turn(client, messages, sandbox, config, request_kwargs)
+        client, messages, request_kwargs = self._make_client_and_messages(
+            self._config,
+            extra_instructions=instructions,
+        )
 
+        self._sub_agents[agent_id] = _SubAgent(
+            sandbox=sandbox,
+            client=client,
+            messages=messages,
+            request_kwargs=request_kwargs,
+            depth=depth + 1,
+        )
 
-async def run_session(config: AgentConfig) -> None:
-    """Interactive session: accept user messages in a loop, run agent turns, print responses."""
-    client, messages, request_kwargs = _init_client_and_messages(config)
+        print(f"[runtime] Sub-agent {agent_id} ready")
+        return agent_id
 
-    async with Sandbox(tag=config.sandbox_image, binds=config.sandbox_binds, host_functions=config.host_functions) as sandbox:
+    async def _host_run_agent(self, agent_id: str, task: str) -> str:
+        """Run a task on a sub-agent. Returns the final text response."""
+        sub = self._sub_agents.get(agent_id)
+        if sub is None:
+            raise RuntimeError(f"Unknown agent_id: {agent_id}")
+
+        print(f"[runtime] Running task on sub-agent {agent_id}: {task[:100]}")
+        sub.messages.append({"role": "user", "content": task})
+        result = await self._run_turn(sub.client, sub.messages, sub.sandbox, self._config, sub.request_kwargs)
+        print(f"[runtime] Sub-agent {agent_id} finished")
+        return result
+
+    # ── Public API ──
+
+    async def run_single(self, user_message: str) -> str:
+        """Run the agent loop for a single message. Returns the final text response."""
+        self._messages.append({"role": "user", "content": user_message})
+        return await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
+
+    async def run_session(self) -> None:
+        """Interactive session: accept user messages in a loop, run agent turns, print responses."""
         print("arcgeneral session started. Type 'quit' or 'exit' to end.\n")
         while True:
             try:
@@ -167,6 +305,6 @@ async def run_session(config: AgentConfig) -> None:
             if not stripped:
                 continue
 
-            messages.append({"role": "user", "content": stripped})
-            result = await _run_turn(client, messages, sandbox, config, request_kwargs)
+            self._messages.append({"role": "user", "content": stripped})
+            await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
             print()

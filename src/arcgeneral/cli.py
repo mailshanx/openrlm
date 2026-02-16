@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from arcgeneral.agent import run_agent, run_session
+from arcgeneral.agent import AgentRuntime
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry
 from arcgeneral.internet_extract import execute_internet_extract
@@ -59,7 +59,7 @@ Search the web and return relevant excerpts with source URLs.
 At least one of `objective` or `search_queries` required; both recommended.
 Query syntax (semicolon-separated): AND, OR, "exact phrase", -exclude, wildcard*
 Use `include_domains`/`exclude_domains` instead of site: operators in queries.
-`after_date` (YYYY-MM-DD) is a soft signal — older results may still appear.
+`after_date` (YYYY-MM-DD) is a soft signal \u2014 older results may still appear.
 Returns a JSON string with key 'results', a list of {url, title, publish_date, excerpts}.
 
 Example: results = await internet_search(objective='recent advances in fusion energy', search_queries='fusion energy 2025; tokamak breakthrough')""",
@@ -71,14 +71,21 @@ Example: results = await internet_search(objective='recent advances in fusion en
         code_timeout=args.timeout,
         max_tool_rounds=args.max_rounds,
         sandbox_binds={str(Path.home() / "Downloads"): "downloads"},
-        host_functions=registry,
     )
 
+    # create_agent/run_agent are registered by AgentRuntime.__init__
+    runtime = AgentRuntime(config, registry)
+
     if args.message is not None:
-        result = asyncio.run(run_agent(config, args.message))
-        print(result)
+        async def _run():
+            async with runtime:
+                return await runtime.run_single(args.message)
+        print(asyncio.run(_run()))
     else:
-        asyncio.run(run_session(config))
+        async def _session():
+            async with runtime:
+                await runtime.run_session()
+        asyncio.run(_session())
 
 
 if __name__ == "__main__":
