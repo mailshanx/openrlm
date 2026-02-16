@@ -145,14 +145,26 @@ class HostFunctionServer:
         entry = self._registry.get(name)
         if entry is None:
             return web.json_response({"error": f"Unknown function: {name}"}, status=404)
-
-        fn, _, _, _ = entry
         try:
             body = await request.json()
             kwargs = body.get("kwargs", {})
             logger.info("Host function call: %s(%s)", name, ", ".join(f"{k}={v!r}" for k, v in kwargs.items()))
-            result = await fn(**kwargs)
-            return web.json_response({"result": result})
+            fn_task = asyncio.create_task(fn(**kwargs))
+
+            while not fn_task.done():
+                proto = request.protocol
+                transport = getattr(proto, 'transport', None) if proto else None
+                if transport is None or transport.is_closing():
+                    fn_task.cancel()
+                    await asyncio.gather(fn_task, return_exceptions=True)
+                    logger.warning("Client disconnected, cancelled %s", name)
+                    return web.Response(status=499)
+                try:
+                    await asyncio.wait_for(asyncio.shield(fn_task), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue
+
+            return web.json_response({"result": fn_task.result()})
         except Exception as e:
             tb = traceback.format_exc()
             logger.error("Host function %s failed:\n%s", name, tb)

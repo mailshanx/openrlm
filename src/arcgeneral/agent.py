@@ -419,6 +419,10 @@ class AgentRuntime:
             raise RuntimeError(f"Unknown task_id: {task_id}")
         try:
             return await task
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         finally:
             self._running_tasks.pop(task_id, None)
 
