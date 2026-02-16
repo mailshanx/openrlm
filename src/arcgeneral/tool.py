@@ -33,4 +33,7 @@ async def execute_tool(sandbox: Sandbox, name: str, arguments: str, timeout: flo
     if name != "python":
         return f"Unknown tool: {name}"
     args = json.loads(arguments)
-    return await sandbox.execute(args["code"], timeout=timeout)
+    code = args.get("code")
+    if not code:
+        return "Error: no code provided in tool call arguments."
+    return await sandbox.execute(code, timeout=timeout)
