@@ -337,8 +337,11 @@ class AgentRuntime:
 
     async def run_single(self, user_message: str) -> str:
         """Run the agent loop for a single message. Returns the final text response."""
+        logger.info("[user] %s", user_message)
         self._messages.append({"role": "user", "content": user_message})
-        return await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
+        result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
+        logger.info("[assistant] %s", result)
+        return result
 
     async def run_session(self) -> None:
         """Interactive session: accept user messages in a loop, run agent turns, print responses."""
@@ -356,7 +359,9 @@ class AgentRuntime:
             if not stripped:
                 continue
 
+            logger.info("[user] %s", stripped)
             self._messages.append({"role": "user", "content": stripped})
             result = await self._run_turn(self._client, self._messages, self._main_sandbox, self._config, self._request_kwargs)
+            logger.info("[assistant] %s", result)
             print(result)
             print()
