@@ -191,12 +191,39 @@ class AgentRuntime:
         except Exception:
             logger.debug("Failed to sync conversation history to kernel", exc_info=True)
 
-    async def _run_turn(self, client: OpenRouter, messages: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict) -> str:
+    @staticmethod
+    def _compress_messages(full_history: list) -> list:
+        """Compress previous turns to user+final-assistant only. Current turn kept in full."""
+        # Find the last user message — everything from there is the current turn
+        last_user_idx = None
+        for i in range(len(full_history) - 1, -1, -1):
+            if full_history[i].get("role") == "user":
+                last_user_idx = i
+                break
+
+        if last_user_idx is None:
+            return list(full_history)
+
+        # Previous turns: keep system, user, and final assistant (no tool_calls) only
+        compressed = []
+        for msg in full_history[:last_user_idx]:
+            role = msg.get("role")
+            if role in ("system", "user"):
+                compressed.append(msg)
+            elif role == "assistant" and "tool_calls" not in msg:
+                compressed.append(msg)
+            # Drop: assistant with tool_calls, tool results
+
+        # Current turn: everything from last user message onward
+        compressed.extend(full_history[last_user_idx:])
+        return compressed
+
+    async def _run_turn(self, client: OpenRouter, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict) -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
         for round_num in range(config.max_tool_rounds):
-
+            compressed = self._compress_messages(full_history)
             response = await client.chat.send_async(
-                messages=messages,
+                messages=compressed,
                 **request_kwargs,
             )
 
@@ -230,10 +257,10 @@ class AgentRuntime:
                     }
                     for tc in msg.tool_calls
                 ]
-            messages.append(assistant_msg)
+            full_history.append(assistant_msg)
 
             if not msg.tool_calls:
-                await self._sync_history(sandbox, messages)
+                await self._sync_history(sandbox, full_history)
                 return msg.content or ""
 
             for tc in msg.tool_calls:
@@ -248,15 +275,15 @@ class AgentRuntime:
                 )
                 preview = result[:200] + '...' if len(result) > 1000 else result
                 print(f"[tool result] {preview}")
-                messages.append({
+                full_history.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": result,
                 })
 
-            await self._sync_history(sandbox, messages)
+            await self._sync_history(sandbox, full_history)
 
-        return messages[-1].get("content", "") if isinstance(messages[-1], dict) else ""
+        return full_history[-1].get("content", "") if isinstance(full_history[-1], dict) else ""
 
     # ── Host functions (called from kernel via HTTP bridge) ──
 
