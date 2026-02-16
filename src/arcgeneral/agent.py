@@ -181,6 +181,15 @@ class AgentRuntime:
 
         return client, messages, request_kwargs
 
+    async def _sync_history(self, sandbox: Sandbox, messages: list) -> None:
+        """Push the full conversation history into the kernel as _conversation_history."""
+        try:
+            payload = json.dumps(messages, ensure_ascii=False)
+            code = f"import json as _json\n_conversation_history = _json.loads({payload!r})"
+            await sandbox.execute(code, timeout=10.0)
+        except Exception:
+            logger.debug("Failed to sync conversation history to kernel", exc_info=True)
+
     async def _run_turn(self, client: OpenRouter, messages: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict) -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
         for round_num in range(config.max_tool_rounds):
@@ -223,6 +232,7 @@ class AgentRuntime:
             messages.append(assistant_msg)
 
             if not msg.tool_calls:
+                await self._sync_history(sandbox, messages)
                 return msg.content or ""
 
             for tc in msg.tool_calls:
@@ -242,6 +252,8 @@ class AgentRuntime:
                     "tool_call_id": tc.id,
                     "content": result,
                 })
+
+            await self._sync_history(sandbox, messages)
 
         return messages[-1].get("content", "") if isinstance(messages[-1], dict) else ""
 
