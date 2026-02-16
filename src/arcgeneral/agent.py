@@ -52,7 +52,9 @@ path shown in the truncation message). To handle larger workloads, delegate to s
 - `agent_id = await create_agent(instructions='...')` — creates an agent with its own Python environment
 - `result = await run_agent(agent_id=agent_id, task='...')` — dispatches a task, returns the final response
 - Run multiple tasks in parallel: `await asyncio.gather(run_agent(...), run_agent(...))`
-- Sub-agents share `/app/downloads/` — use files to pass data between agents.\
+- Sub-agents share `/app/downloads/` — use files to pass data between agents.
+- The `instructions` parameter is appended to the agent's system prompt — use it for role, \
+expertise, and constraints. Use `task` for the actual work.\
 """
 
 
