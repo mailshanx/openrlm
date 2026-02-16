@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Self
 
 from openrouter import OpenRouter
-from openrouter.errors import OpenRouterError
 
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
@@ -18,8 +17,6 @@ from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 524, 529}
-_MAX_LLM_RETRIES = 5
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a helpful assistant with access to a stateful Python execution environment.
@@ -249,29 +246,18 @@ class AgentRuntime:
         compressed.extend(full_history[last_user_idx:])
         return compressed
 
-    async def _llm_call_with_retry(self, client: OpenRouter, compressed: list, request_kwargs: dict, agent_label: str):
-        """Call the LLM with retry on transient errors."""
-        for attempt in range(_MAX_LLM_RETRIES + 1):
-            try:
-                return await client.chat.send_async(
-                    messages=compressed,
-                    **request_kwargs,
-                )
-            except OpenRouterError as e:
-                if e.status_code not in _RETRYABLE_STATUS_CODES or attempt == _MAX_LLM_RETRIES:
-                    raise
-                wait = 2 ** attempt
-                logger.warning(
-                    "[%s] Retryable LLM error (HTTP %d), attempt %d/%d, waiting %ds: %s",
-                    agent_label, e.status_code, attempt + 1, _MAX_LLM_RETRIES, wait, e,
-                )
-                await asyncio.sleep(wait)
+    async def _llm_call(self, client: OpenRouter, messages: list, request_kwargs: dict):
+        """Single LLM call. Separated for easy extension with retry logic."""
+        return await client.chat.send_async(
+            messages=messages,
+            **request_kwargs,
+        )
 
     async def _run_turn(self, client: OpenRouter, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main") -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
         for round_num in range(config.max_tool_rounds):
             compressed = self._compress_messages(full_history)
-            response = await self._llm_call_with_retry(client, compressed, request_kwargs, agent_label)
+            response = await self._llm_call(client, compressed, request_kwargs)
 
             choice = response.choices[0]
             msg = choice.message
