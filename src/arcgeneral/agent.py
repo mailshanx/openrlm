@@ -72,7 +72,8 @@ async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config
                 tc.function.arguments or "{}",
                 timeout=config.code_timeout,
             )
-            print(f"[tool result] {result}")
+            preview = result[:1000] + '...' if len(result) > 1000 else result
+            print(f"[tool result] {preview}")
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
