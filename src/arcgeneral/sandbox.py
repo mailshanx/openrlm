@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 import aiohttp
+import aiodocker
 from ipybox import ExecutionClient, ExecutionContainer, ExecutionError
 from arcgeneral.host_functions import HostFunctionServer
 from typing import Self
@@ -27,6 +28,7 @@ class _Container(ExecutionContainer):
 
         config = {
             "Image": self.tag,
+            "Labels": {"arcgeneral": "true"},
             "HostConfig": {
                 "CapAdd": ["NET_ADMIN", "NET_RAW"],
                 "PortBindings": {
@@ -117,9 +119,9 @@ class Sandbox:
                 self._client = None
         if self._container is not None:
             try:
-                await self._container.__aexit__(exc_type, exc_val, exc_tb)
+                await self._container.kill()
             except Exception:
-                logger.warning("Failed to kill ExecutionContainer", exc_info=True)
+                logger.warning("Failed to kill container", exc_info=True)
             finally:
                 self._container = None
 
@@ -171,3 +173,27 @@ class Sandbox:
             return f"Code execution timed out after {timeout} seconds."
         except Exception as e:
             await self._dump_logs_and_die(e)
+
+async def cleanup_orphaned_containers():
+    """Kill and remove any containers from previous arcgeneral runs."""
+    try:
+        docker = aiodocker.Docker()
+        containers = await docker.containers.list(
+            all=True,
+            filters={"label": ["arcgeneral=true"]},
+        )
+        for c in containers:
+            info = await c.show()
+            name = info.get("Name", c.id[:12]).lstrip("/")
+            try:
+                await c.kill()
+            except Exception:
+                pass
+            try:
+                await c.delete(force=True)
+            except Exception:
+                pass
+            logger.info("Cleaned up orphaned container %s", name)
+        await docker.close()
+    except Exception:
+        logger.debug("Failed to clean up orphaned containers", exc_info=True)

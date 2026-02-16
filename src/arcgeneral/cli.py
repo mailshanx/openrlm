@@ -1,15 +1,18 @@
 import argparse
 import asyncio
 import logging
+import signal
+from pathlib import Path
+import asyncio
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
-
-from arcgeneral.agent import AgentRuntime
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry
 from arcgeneral.internet_extract import execute_internet_extract
 from arcgeneral.internet_search import execute_internet_search
+from arcgeneral.sandbox import cleanup_orphaned_containers
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,12 +87,16 @@ Example: results = await internet_search(objective='recent advances in fusion en
 
     if args.message is not None:
         async def _run():
+            await cleanup_orphaned_containers()
             async with runtime:
                 return await runtime.run_single(args.message)
         print(asyncio.run(_run()))
     else:
         async def _session():
+            await cleanup_orphaned_containers()
             async with runtime:
+                loop = asyncio.get_event_loop()
+                loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(runtime.__aexit__(None, None, None)))
                 await runtime.run_session()
         asyncio.run(_session())
 
