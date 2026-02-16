@@ -40,7 +40,7 @@ STUB_TEMPLATE = """\
 async def $name($sig):
     _kwargs = {}
 $kwargs_lines
-    async with _httpx.AsyncClient(timeout=_httpx.Timeout(300)) as _client:
+    async with _httpx.AsyncClient(timeout=_httpx.Timeout($timeout)) as _client:
         _resp = await _client.post(f"{_HOST_FUNCTION_URL}/$name", json={"kwargs": _kwargs})
     _body = _resp.json()
     if "error" in _body:
@@ -52,27 +52,27 @@ class HostFunctionRegistry:
     """Registry of async callables that the sandbox kernel can invoke."""
 
     def __init__(self):
-        self._functions: dict[str, tuple[callable, list[str], str]] = {}
+        self._functions: dict[str, tuple[callable, list[str], str, float]] = {}
 
-    def register(self, name: str, fn: callable, description: str = "") -> None:
+    def register(self, name: str, fn: callable, description: str = "", timeout: float = 300.0) -> None:
         """Register an async callable under the given name.
-        inspection and used to generate the kernel-side stub signature.
         Args:
             name: Name the kernel stub will be callable as.
             fn: Async callable to execute on the host when the stub is invoked.
             description: Human-readable description for the system prompt.
+            timeout: HTTP timeout in seconds for the kernel-side stub (default 300).
         """
         if not asyncio.iscoroutinefunction(fn):
             raise TypeError(f"{name}: host functions must be async")
         sig = inspect.signature(fn)
         param_names = [p.name for p in sig.parameters.values()]
-        self._functions[name] = (fn, param_names, description)
+        self._functions[name] = (fn, param_names, description, timeout)
 
     @property
     def names(self) -> list[str]:
         return list(self._functions.keys())
 
-    def get(self, name: str) -> tuple[callable, list[str], str] | None:
+    def get(self, name: str) -> tuple[callable, list[str], str, float] | None:
         return self._functions.get(name)
 
     def build_schemas_json(self) -> str:
@@ -82,7 +82,7 @@ class HostFunctionRegistry:
         import json as _json
 
         schemas = []
-        for name, (fn, param_names, description) in self._functions.items():
+        for name, (fn, param_names, description, timeout) in self._functions.items():
             sig = inspect.signature(fn)
             properties = {}
             required = []
@@ -146,7 +146,7 @@ class HostFunctionServer:
         if entry is None:
             return web.json_response({"error": f"Unknown function: {name}"}, status=404)
 
-        fn, _, _ = entry
+        fn, _, _, _ = entry
         try:
             body = await request.json()
             kwargs = body.get("kwargs", {})
@@ -166,7 +166,7 @@ class HostFunctionServer:
         """
         base_url = f"http://host.docker.internal:{self.port}/call"
         stubs = []
-        for name, (fn, param_names, _) in self._registry._functions.items():
+        for name, (fn, param_names, _, timeout) in self._registry._functions.items():
             sig = inspect.signature(fn)
             params = []
             for pname, param in sig.parameters.items():
@@ -177,7 +177,7 @@ class HostFunctionServer:
             sig_str = ", ".join(params)
             kwargs_lines = "\n".join(f"    _kwargs[{pname!r}] = {pname}" for pname in param_names)
             t = string.Template(STUB_TEMPLATE)
-            stubs.append(t.substitute(name=name, sig=sig_str, kwargs_lines=kwargs_lines))
+            stubs.append(t.substitute(name=name, sig=sig_str, kwargs_lines=kwargs_lines, timeout=timeout))
 
         preamble = PREAMBLE_HEADER.replace("$BASE_URL", base_url)
         return preamble + "\n" + "\n".join(stubs)

@@ -116,6 +116,7 @@ class AgentRuntime:
                 "Conversation history persists across calls to the same agent_id. "
                 "Returns the sub-agent's final text response."
             ),
+            timeout=None,
         )
 
     async def __aenter__(self) -> Self:
