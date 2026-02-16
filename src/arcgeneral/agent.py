@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+from pathlib import Path
 import sys
 
 from openrouter import OpenRouter
@@ -45,6 +46,12 @@ code — never as separate tool calls.
 
 async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict) -> str:
     """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
+    # Resolve host downloads dir from sandbox_binds for output spooling
+    host_downloads_dir = None
+    for host_path, container_name in config.sandbox_binds.items():
+        if container_name == "downloads":
+            host_downloads_dir = Path(host_path)
+            break
     for round_num in range(config.max_tool_rounds):
 
         response = await client.chat.send_async(
@@ -93,6 +100,9 @@ async def _run_turn(client: OpenRouter, messages: list, sandbox: Sandbox, config
                 tc.function.name,
                 tc.function.arguments or "{}",
                 timeout=config.code_timeout,
+                limit_lines=config.output_limit_lines,
+                limit_bytes=config.output_limit_bytes,
+                host_downloads_dir=host_downloads_dir,
             )
             preview = result[:200] + '...' if len(result) > 1000 else result
             print(f"[tool result] {preview}")
