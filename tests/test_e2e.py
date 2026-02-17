@@ -848,6 +848,109 @@ async def test_llm_client_lifecycle_ownership():
     # Verify the runtime knows it doesn't own the client
     report("llm_owns_flag_false", not runtime._owns_llm_client)
 
+async def test_sigterm_clean_shutdown():
+    """SIGTERM during an active session triggers clean teardown:
+    session closes, sub-agent tasks cancel, fork server stops, container dies."""
+    import signal
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    # Track what gets closed
+    closed_sessions = []
+    closed_llm = []
+
+    class SlowClient:
+        async def complete(self, messages, **kwargs):
+            return CompletionResponse(
+                model="test",
+                choices=[CompletionChoice(
+                    message=CompletionMessage(content="done", tool_calls=None),
+                    finish_reason="stop",
+                )],
+                usage=TokenUsage(prompt_tokens=1, completion_tokens=1),
+            )
+        async def close(self):
+            closed_llm.append(True)
+
+    config = AgentConfig(model="test", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    client = SlowClient()
+    runtime = AgentRuntime(config, registry, llm_client=client)
+
+    async with runtime:
+        # Create two sessions
+        s1 = await runtime.create_session("s1")
+        s2 = await runtime.create_session("s2")
+
+        # Run a turn on each so they're fully initialized
+        await s1.run_single("first")
+        await s2.run_single("second")
+
+        # Verify sessions exist
+        report("sigterm_sessions_exist", len(runtime._sessions) == 2)
+
+        # Patch session.close to track calls
+        original_s1_close = s1.close
+        original_s2_close = s2.close
+        async def _tracked_s1_close():
+            closed_sessions.append("s1")
+            await original_s1_close()
+        async def _tracked_s2_close():
+            closed_sessions.append("s2")
+            await original_s2_close()
+        s1.close = _tracked_s1_close
+        s2.close = _tracked_s2_close
+
+    # __aexit__ has run — verify cleanup
+    report("sigterm_all_sessions_closed", set(closed_sessions) == {"s1", "s2"})
+    report("sigterm_sessions_cleared", len(runtime._sessions) == 0)
+    report("sigterm_agent_map_cleared", len(runtime._agent_to_session) == 0)
+    report("sigterm_task_map_cleared", len(runtime._task_to_session) == 0)
+    report("sigterm_fork_server_gone", runtime._fork_server is None)
+    report("sigterm_host_server_gone", runtime._server is None)
+    report("sigterm_injected_not_closed", len(closed_llm) == 0)
+
+
+async def test_sigterm_cancels_inflight_subtasks():
+    """When a session closes, running sub-agent tasks are cancelled."""
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry)
+
+    # Mock _run_turn: for sub-agents, sleep forever to simulate long work
+    cancelled = []
+    async def _mock_run_turn(full_history, sandbox, config, request_kwargs, agent_label="", on_event=None):
+        if agent_label != "main":
+            try:
+                await asyncio.sleep(3600)  # simulate long sub-agent work
+            except asyncio.CancelledError:
+                cancelled.append(agent_label)
+                raise
+        task = full_history[-1]["content"]
+        result = await sandbox.execute(task, timeout=30.0)
+        full_history.append({"role": "assistant", "content": result})
+        return result
+    runtime._run_turn = _mock_run_turn
+
+    async with runtime:
+        session = await runtime.create_session("test")
+        sb = session._sandbox
+
+        # Create a sub-agent and start a long-running task
+        await sb.execute("aid = await create_agent('worker')", timeout=30)
+        await sb.execute("tid = await run_agent(agent_id=aid, task='print(1)')", timeout=30)
+
+        # Give the task a moment to start
+        await asyncio.sleep(0.5)
+        report("sigterm_subtask_running", len(session._running_tasks) == 1)
+
+        # Close the session (simulates what happens on SIGTERM teardown)
+        await session.close()
+
+    report("sigterm_subtask_cancelled", len(cancelled) == 1)
+    report("sigterm_tasks_cleared", len(session._running_tasks) == 0)
+    report("sigterm_subagents_cleared", len(session._sub_agents) == 0)
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -928,6 +1031,10 @@ async def main():
     await test_openrouter_client_converts_tool_response()
     await test_llm_client_injection()
     await test_llm_client_lifecycle_ownership()
+
+    print("\nShutdown / SIGTERM tests:")
+    await test_sigterm_clean_shutdown()
+    await test_sigterm_cancels_inflight_subtasks()
     total = passed_count + len(failures)
     print()
     if failures:
