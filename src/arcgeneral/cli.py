@@ -74,13 +74,14 @@ def main():
             async with runtime:
                 session = await runtime.create_session("cli")
                 loop = asyncio.get_event_loop()
-                loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(runtime.__aexit__(None, None, None)))
-                print("arcgeneral session started. Type 'quit' or 'exit' to end.\n")
-                while True:
+                shutdown = asyncio.Event()
+
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    loop.add_signal_handler(sig, shutdown.set)
+                while not shutdown.is_set():
                     try:
-                        user_input = input(">>> ")
-                    except (EOFError, KeyboardInterrupt):
-                        print()
+                        user_input = await loop.run_in_executor(None, input, ">>> ")
+                    except EOFError:
                         break
                     stripped = user_input.strip()
                     if stripped.lower() in ("quit", "exit"):
