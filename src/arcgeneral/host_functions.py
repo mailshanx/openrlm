@@ -22,11 +22,15 @@ Usage:
 
 import asyncio
 import inspect
+import json as _json
 import string
 import logging
 import traceback
+from typing import Any, get_type_hints
 
 from aiohttp import web
+from pydantic import create_model
+from pydantic.fields import FieldInfo
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +51,7 @@ $kwargs_lines
         raise RuntimeError(_body["error"])
     return _body["result"]
 """
+
 
 class HostFunctionRegistry:
     """Registry of async callables that the sandbox kernel can invoke."""
@@ -75,32 +80,56 @@ class HostFunctionRegistry:
     def get(self, name: str) -> tuple[callable, list[str], str, float] | None:
         return self._functions.get(name)
 
+    @staticmethod
+    def _build_function_schema(fn: callable, name: str, description: str) -> dict:
+        """Build a JSON schema dict for a single host function using Pydantic.
+
+        Inspects the function's type hints and signature to produce a proper
+        JSON Schema.  Parameters whose names start with '_' are treated as
+        internal and excluded from the schema.
+        """
+        type_hints = get_type_hints(fn, include_extras=True)
+        sig = inspect.signature(fn)
+        field_definitions: dict[str, Any] = {}
+        for pname, param in sig.parameters.items():
+            if pname.startswith("_"):
+                continue
+            param_type = type_hints.get(pname, str)
+            if param.default is not inspect.Parameter.empty:
+                field_definitions[pname] = (param_type, FieldInfo(default=param.default, annotation=param_type))
+            else:
+                field_definitions[pname] = (param_type, FieldInfo(annotation=param_type))
+
+        model = create_model(f"{name}_Schema", **field_definitions)
+        schema = model.model_json_schema()
+
+        # Strip Pydantic's auto-generated titles
+        HostFunctionRegistry._strip_titles(schema)
+
+        return {
+            "name": name,
+            "description": description,
+            "parameters": schema,
+        }
+
+    @staticmethod
+    def _strip_titles(schema: dict | list) -> None:
+        """Remove 'title' keys from a JSON schema in-place, recursively."""
+        if isinstance(schema, dict):
+            schema.pop("title", None)
+            for v in schema.values():
+                HostFunctionRegistry._strip_titles(v)
+        elif isinstance(schema, list):
+            for item in schema:
+                HostFunctionRegistry._strip_titles(item)
+
     def build_schemas_json(self) -> str:
         """Return JSON array of function schemas for embedding in system prompt."""
         if not self._functions:
             return "(none)"
-        import json as _json
-
         schemas = []
-        for name, (fn, param_names, description, timeout) in self._functions.items():
-            sig = inspect.signature(fn)
-            properties = {}
-            required = []
-            for pname, param in sig.parameters.items():
-                prop: dict = {"type": "string"}
-                if param.annotation is bool:
-                    prop = {"type": "boolean"}
-                if param.default is inspect.Parameter.empty:
-                    required.append(pname)
-                else:
-                    prop["default"] = param.default
-                properties[pname] = prop
-            schemas.append({
-                "name": name,
-                "description": description,
-                "parameters": properties,
-            })
-
+        for name, (fn, _, description, _) in self._functions.items():
+            schemas.append(self._build_function_schema(fn, name, description))
         return _json.dumps(schemas, indent=2)
 
 
