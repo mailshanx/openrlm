@@ -138,18 +138,24 @@ class Session:
         self._on_event = on_event
         self._sub_agents: dict[str, _SubAgent] = {}
         self._running_tasks: dict[str, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
 
+    @property
+    def session_id(self) -> str:
+        """The caller-provided session ID."""
+        return self._session_id
     async def run_single(self, user_message: str) -> str:
         """Run the agent loop for a single message. Returns the final text response."""
-        logger.info("[user] %s", user_message)
-        self._messages.append({"role": "user", "content": user_message})
-        result = await self._runtime._run_turn(
-            self._messages, self._sandbox, self._runtime._config,
-            self._request_kwargs, agent_label="main",
-            on_event=self._on_event,
-        )
-        logger.info("[assistant] %s", result)
-        return result
+        async with self._lock:
+            logger.info("[user] %s", user_message)
+            self._messages.append({"role": "user", "content": user_message})
+            result = await self._runtime._run_turn(
+                self._messages, self._sandbox, self._runtime._config,
+                self._request_kwargs, agent_label="main",
+                on_event=self._on_event,
+            )
+            logger.info("[assistant] %s", result)
+            return result
 
     async def close(self):
         """Close this session: cancel tasks, destroy sandboxes, unregister from runtime."""
@@ -182,10 +188,7 @@ class Session:
 
         # Unregister from runtime
         self._runtime._agent_to_session.pop(self._session_id, None)
-        try:
-            self._runtime._sessions.remove(self)
-        except ValueError:
-            pass
+        self._runtime._sessions.pop(self._session_id, None)
 
 
 class AgentRuntime:
@@ -201,10 +204,9 @@ class AgentRuntime:
         self._owns_llm_client = llm_client is None
 
         # Session tracking
-        self._sessions: list[Session] = []
+        self._sessions: dict[str, Session] = {}
         self._agent_to_session: dict[str, Session] = {}
         self._task_to_session: dict[str, Session] = {}
-        self._default_session: Session | None = None
 
         # Spool dir for truncated output (temp dir, cleaned up on __aexit__)
         self._spool_dir: Path | None = None
@@ -247,8 +249,8 @@ class AgentRuntime:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Close all sessions (including default)
-        for session in list(self._sessions):
+        # Close all sessions
+        for session in list(self._sessions.values()):
             try:
                 await session.close()
             except Exception:
@@ -256,7 +258,6 @@ class AgentRuntime:
         self._sessions.clear()
         self._agent_to_session.clear()
         self._task_to_session.clear()
-        self._default_session = None
 
         # Stop fork server (kills the container)
         if self._fork_server is not None:
@@ -294,9 +295,10 @@ class AgentRuntime:
 
     # ── Session management ──
 
-    async def create_session(self, on_event=None) -> Session:
+    async def create_session(self, session_id: str, *, on_event=None) -> Session:
         """Create a new independent session with its own sandbox and message history."""
-        session_id = uuid.uuid4().hex[:12]
+        if session_id in self._sessions:
+            raise ValueError(f"Session {session_id!r} already exists")
         sandbox = await self._fork_server.create_sandbox()
         await self._inject_agent_id(sandbox, session_id)
         messages, request_kwargs = self._init_messages(self._config)
@@ -309,8 +311,21 @@ class AgentRuntime:
             on_event=on_event,
         )
         self._agent_to_session[session_id] = session
-        self._sessions.append(session)
+        self._sessions[session_id] = session
         return session
+
+    def get_session(self, session_id: str) -> Session:
+        """Retrieve an existing session by ID."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Unknown session: {session_id!r}")
+        return session
+
+    async def close_session(self, session_id: str) -> None:
+        """Close and remove a session by ID. No-op if session doesn't exist."""
+        session = self._sessions.get(session_id)
+        if session is not None:
+            await session.close()
 
     def _init_messages(self, config: AgentConfig, extra_instructions: str | None = None) -> tuple[list, dict]:
         """Seed the messages list and build request kwargs."""
@@ -601,16 +616,3 @@ class AgentRuntime:
         finally:
             session._running_tasks.pop(task_id, None)
             self._task_to_session.pop(task_id, None)
-
-    # ── Public API ──
-
-    async def run_single(self, user_message: str, on_event=None) -> str:
-        """Convenience: run a single message in a default session.
-
-        For multi-session usage, call create_session() instead.
-        """
-        if self._default_session is None:
-            self._default_session = await self.create_session(on_event=on_event)
-        elif on_event is not None:
-            self._default_session._on_event = on_event
-        return await self._default_session.run_single(user_message)

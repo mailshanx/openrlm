@@ -63,16 +63,16 @@ def main():
         async def _run():
             await cleanup_orphaned_containers()
             async with runtime:
-                session = await runtime.create_session()
+                session = await runtime.create_session("cli")
                 result = await session.run_single(args.message)
-                await session.close()
+                await runtime.close_session("cli")
                 return result
         print(asyncio.run(_run()))
     else:
         async def _session():
             await cleanup_orphaned_containers()
             async with runtime:
-                session = await runtime.create_session()
+                session = await runtime.create_session("cli")
                 loop = asyncio.get_event_loop()
                 loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(runtime.__aexit__(None, None, None)))
                 print("arcgeneral session started. Type 'quit' or 'exit' to end.\n")
@@ -90,7 +90,7 @@ def main():
                     result = await session.run_single(stripped)
                     print(result)
                     print()
-                await session.close()
+                await runtime.close_session("cli")
         asyncio.run(_session())
 
 

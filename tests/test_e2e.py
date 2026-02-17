@@ -444,7 +444,7 @@ async def test_host_function_path_serialization():
     runtime._run_turn = _mock_run_turn
 
     async with runtime:
-        session = await runtime.create_session()
+        session = await runtime.create_session("test")
         sb = session._sandbox
         # Step 1: basic sandbox works
         r = await sb.execute("print('hello')", timeout=10)
@@ -563,7 +563,7 @@ async def test_event_emission_two_rounds():
         return responses.pop(0)
 
     async with runtime:
-        session = await runtime.create_session()
+        session = await runtime.create_session("test")
         events = []
         runtime._llm_call = mock_llm
         messages = list(session._messages)
@@ -603,7 +603,7 @@ async def test_event_emission_immediate():
         return _text_resp("Hello!")
 
     async with runtime:
-        session = await runtime.create_session()
+        session = await runtime.create_session("test")
         events = []
         runtime._llm_call = mock_llm
         messages = list(session._messages)
@@ -634,7 +634,7 @@ async def test_event_callback_error_isolation():
         return _text_resp("Survived")
 
     async with runtime:
-        session = await runtime.create_session()
+        session = await runtime.create_session("test")
         def exploding_callback(event):
             raise ValueError("consumer bug")
         runtime._llm_call = mock_llm
@@ -660,7 +660,7 @@ async def test_event_no_callback():
         return _text_resp("No events")
 
     async with runtime:
-        session = await runtime.create_session()
+        session = await runtime.create_session("test")
         runtime._llm_call = mock_llm
         messages = list(session._messages)
         messages.append({"role": "user", "content": "Test"})
@@ -707,7 +707,7 @@ print(f'sub says: {result}')"""
 
     async with runtime:
         events = []
-        session = await runtime.create_session(on_event=events.append)
+        session = await runtime.create_session("test", on_event=events.append)
         runtime._llm_call = mock_llm
         messages = list(session._messages)
         messages.append({"role": "user", "content": "Use a sub-agent"})
@@ -810,7 +810,8 @@ async def test_llm_client_injection():
     runtime = AgentRuntime(config, registry, llm_client=MockClient())
 
     async with runtime:
-        result = await runtime.run_single("test injection")
+        session = await runtime.create_session("test")
+        result = await session.run_single("test injection")
 
     report("llm_injection_used", len(calls) == 1 and calls[0] == "injected-model")
     report("llm_injection_result", result == "from injected")
@@ -839,7 +840,8 @@ async def test_llm_client_lifecycle_ownership():
     runtime = AgentRuntime(config, registry, llm_client=injected)
 
     async with runtime:
-        await runtime.run_single("test lifecycle")
+        session = await runtime.create_session("test")
+        await session.run_single("test lifecycle")
 
     report("llm_injected_not_closed", len(closed) == 0)
 
