@@ -32,6 +32,14 @@ from arcgeneral.llm import (
 
 TAG = "arcgeneral:sandbox"
 
+
+class _NullClient:
+    """Mock LLM client that raises if accidentally called."""
+    async def complete(self, messages, **kwargs):
+        raise RuntimeError("_NullClient.complete() should never be called — mock _run_turn or _llm_call first")
+    async def close(self):
+        pass
+
 passed_count = 0
 failures: list[str] = []
 
@@ -428,12 +436,9 @@ async def test_host_function_path_serialization():
     Verifies that two concurrent run_agent calls on the same sub-agent are
     serialized end-to-end, not just at the fork server level.
     """
-    import os
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
-
     config = AgentConfig(model="test/model", sandbox_image=TAG)
     registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     # Replace _run_turn: skip LLM, just execute the task string as code.
     async def _mock_run_turn(full_history, sandbox, config, request_kwargs, agent_label="", on_event=None):
@@ -552,11 +557,10 @@ async def test_event_emission_two_rounds():
       RoundStart(1) ModelRequest ModelResponse(tool_calls=False)
       TurnEnd(rounds=2)
     """
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
 
     config = AgentConfig(model="test/model", sandbox_image=TAG)
     registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     responses = [_tool_resp("print(2+2)", pt=100, ct=50), _text_resp("The answer is 4", pt=120, ct=60)]
     async def mock_llm(messages, request_kwargs):
@@ -593,11 +597,10 @@ async def test_event_emission_two_rounds():
 
 async def test_event_emission_immediate():
     """_run_turn emits 4 events when LLM responds immediately (no tool calls)."""
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
 
     config = AgentConfig(model="test/model", sandbox_image=TAG)
     registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     async def mock_llm(messages, request_kwargs):
         return _text_resp("Hello!")
@@ -624,11 +627,10 @@ async def test_event_emission_immediate():
 
 async def test_event_callback_error_isolation():
     """A broken event callback must not crash _run_turn."""
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
 
     config = AgentConfig(model="test/model", sandbox_image=TAG)
     registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     async def mock_llm(messages, request_kwargs):
         return _text_resp("Survived")
@@ -650,11 +652,10 @@ async def test_event_callback_error_isolation():
 
 async def test_event_no_callback():
     """_run_turn works identically when _on_event is None (backward compat)."""
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
 
     config = AgentConfig(model="test/model", sandbox_image=TAG)
     registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     async def mock_llm(messages, request_kwargs):
         return _text_resp("No events")
@@ -686,11 +687,10 @@ async def test_event_sub_agent_propagation():
       Main  ToolExecEnd
       Main  RoundStart(1) ModelRequest ModelResponse(no_tools) TurnEnd
     """
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
 
     config = AgentConfig(model="test/model", sandbox_image=TAG)
     registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     sub_agent_code = """aid = await create_agent(instructions='helper')
 tid = await run_agent(agent_id=aid, task='Say hello')
@@ -788,7 +788,6 @@ async def test_openrouter_client_converts_tool_response():
 
 async def test_llm_client_injection():
     """AgentRuntime uses an injected LLMClient instead of creating a default."""
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
     calls = []
 
     class MockClient:
@@ -818,7 +817,6 @@ async def test_llm_client_injection():
 
 async def test_llm_client_lifecycle_ownership():
     """Injected client is NOT closed on __aexit__; default client IS closed."""
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
     closed = []
 
     class TrackingClient:
@@ -852,7 +850,6 @@ async def test_sigterm_clean_shutdown():
     """SIGTERM during an active session triggers clean teardown:
     session closes, sub-agent tasks cancel, fork server stops, container dies."""
     import signal
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
 
     # Track what gets closed
     closed_sessions = []
@@ -912,11 +909,10 @@ async def test_sigterm_clean_shutdown():
 
 async def test_sigterm_cancels_inflight_subtasks():
     """When a session closes, running sub-agent tasks are cancelled."""
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
 
     config = AgentConfig(model="test/model", sandbox_image=TAG)
     registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     # Mock _run_turn: for sub-agents, sleep forever to simulate long work
     cancelled = []
@@ -957,7 +953,6 @@ async def test_cancellation_rolls_back_history():
     """When _run_turn is cancelled mid-round, full_history rolls back to
     the checkpoint — no dangling assistant tool_calls without matching
     tool results."""
-    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
 
     call_count = 0
 
