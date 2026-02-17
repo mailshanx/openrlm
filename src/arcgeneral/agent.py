@@ -3,6 +3,8 @@ import logging
 import json
 import os
 import time
+import shutil
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -204,12 +206,8 @@ class AgentRuntime:
         self._task_to_session: dict[str, Session] = {}
         self._default_session: Session | None = None
 
-        # Resolve host workspace dir from sandbox_binds for output spooling
-        self._host_workspace_dir: Path | None = None
-        for host_path, container_name in config.sandbox_binds.items():
-            if container_name == "workspace":
-                self._host_workspace_dir = Path(host_path)
-                break
+        # Spool dir for truncated output (temp dir, cleaned up on __aexit__)
+        self._spool_dir: Path | None = None
 
         # Register runtime host functions into the registry (before server starts,
         # so they appear in the system prompt and get kernel stubs).
@@ -248,10 +246,14 @@ class AgentRuntime:
             self._server = HostFunctionServer(self._registry)
             await self._server.__aenter__()
 
+        # Create temp spool dir and add as bind mount
+        self._spool_dir = Path(tempfile.mkdtemp(prefix="arcgeneral_spool_"))
+        binds = dict(self._config.sandbox_binds)
+        binds[str(self._spool_dir)] = "spool"
         # Start fork server (one container for all sessions)
         self._fork_server = ForkServer(
             tag=self._config.sandbox_image,
-            binds=self._config.sandbox_binds,
+            binds=binds,
             host_function_server=self._server,
         )
         await self._fork_server.__aenter__()
@@ -303,6 +305,13 @@ class AgentRuntime:
                 logger.warning("Failed to close LLM client", exc_info=True)
             finally:
                 self._llm_client = None
+
+        # Clean up spool dir
+        if self._spool_dir is not None:
+            try:
+                shutil.rmtree(self._spool_dir, ignore_errors=True)
+            finally:
+                self._spool_dir = None
 
     # ── Session management ──
 
@@ -504,7 +513,8 @@ class AgentRuntime:
                     timeout=config.code_timeout,
                     limit_lines=config.output_limit_lines,
                     limit_bytes=config.output_limit_bytes,
-                    host_workspace_dir=self._host_workspace_dir,
+                    host_spool_dir=self._spool_dir,
+                    container_spool_dir="/app/spool",
                 )
                 self._emit(on_event, ToolExecEnd(agent_id=agent_label, tool_name=tc.function.name, elapsed_seconds=time.monotonic() - tool_start))
                 logger.info("[%s] [tool result] %s", agent_label, result)

@@ -1,5 +1,4 @@
 import json
-import os
 import uuid
 from pathlib import Path
 
@@ -13,7 +12,7 @@ PYTHON_TOOL_SCHEMA = {
         "description": (
             "Execute Python code in a persistent IPython environment. "
             "Variables, imports, and function definitions persist across calls. "
-            "Common libraries are pre-installed (numpy, pandas, matplotlib, scipy, etc.). "
+            "Common libraries are pre-installed (numpy, pandas, requests, httpx, etc.). "
             "Returns stdout/stderr output, or an error traceback if the code fails."
         ),
         "parameters": {
@@ -76,7 +75,8 @@ async def execute_tool(
     timeout: float,
     limit_lines: int = 2000,
     limit_bytes: int = 50_000,
-    host_workspace_dir: Path | None = None,
+    host_spool_dir: Path | None = None,
+    container_spool_dir: str = "/app/spool",
 ) -> str:
     """Dispatch a tool call. Returns the result string, truncated if needed."""
     if name != "python":
@@ -90,13 +90,13 @@ async def execute_tool(
         return "Error: no code provided in tool call arguments."
     result = await sandbox.execute(code, timeout=timeout)
 
-    if host_workspace_dir is not None:
+    if host_spool_dir is not None:
         result = _truncate_and_spool(
             result,
             limit_lines=limit_lines,
             limit_bytes=limit_bytes,
-            host_spool_dir=host_workspace_dir / ".arcgeneral_spool",
-            container_spool_dir="/app/workspace/.arcgeneral_spool",
+            host_spool_dir=host_spool_dir,
+            container_spool_dir=container_spool_dir,
         )
 
     return result
