@@ -211,32 +211,11 @@ class AgentRuntime:
 
         # Register runtime host functions into the registry (before server starts,
         # so they appear in the system prompt and get kernel stubs).
-        registry.register(
-            "create_agent",
-            self._host_create_agent,
-            description=(
-                "Create a sub-agent with its own Python environment. "
-                "The sub-agent has the same capabilities and functions as you, "
-                "plus any additional instructions you provide. "
-                "Returns an agent_id string to use with run_agent."
-            ),
-        )
-        registry.register(
-            "run_agent",
-            self._host_run_agent,
-            description=(
-                "Start a task on a previously created sub-agent. "
-                "Returns a task_id immediately — the sub-agent runs in the background. "
-                "Use await_result(task_id) to collect the result."
-            ),
-        )
+        registry.register("create_agent", self._host_create_agent)
+        registry.register("run_agent", self._host_run_agent)
         registry.register(
             "await_result",
             self._host_await_result,
-            description=(
-                "Block until a background task completes and return the result. "
-                "Pass the task_id returned by run_agent."
-            ),
             timeout=max(config.code_timeout - 30, 30),
         )
 
@@ -537,7 +516,11 @@ class AgentRuntime:
     # ── Host functions (called from kernel via HTTP bridge) ──
 
     async def _host_create_agent(self, instructions: str, _caller_id: str = "main") -> str:
-        """Create a sub-agent. Returns agent_id. Sandbox is created lazily on first run_agent."""
+        """Create a sub-agent with its own Python environment.
+
+        The sub-agent has the same capabilities and functions as you,
+        plus any additional instructions you provide.
+        Returns an agent_id string to use with run_agent."""
         session = self._agent_to_session.get(_caller_id)
         if session is None:
             raise RuntimeError(f"Unknown caller: {_caller_id}")
@@ -569,7 +552,10 @@ class AgentRuntime:
         logger.info("[runtime] Sub-agent %s ready", agent_id)
 
     async def _host_run_agent(self, agent_id: str, task: str) -> str:
-        """Start a task on a sub-agent. Returns task_id immediately."""
+        """Start a task on a previously created sub-agent.
+
+        Returns a task_id immediately — the sub-agent runs in the background.
+        Use await_result(task_id) to collect the result."""
         session = self._agent_to_session.get(agent_id)
         if session is None:
             raise RuntimeError(f"Unknown agent_id: {agent_id}")
@@ -597,7 +583,9 @@ class AgentRuntime:
         return task_id
 
     async def _host_await_result(self, task_id: str) -> str:
-        """Block until a background task completes. Returns the final text response."""
+        """Block until a background task completes and return the result.
+
+        Pass the task_id returned by run_agent."""
         session = self._task_to_session.get(task_id)
         if session is None:
             raise RuntimeError(f"Unknown task_id: {task_id}")

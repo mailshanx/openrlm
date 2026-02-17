@@ -59,19 +59,21 @@ class HostFunctionRegistry:
     def __init__(self):
         self._functions: dict[str, tuple[callable, list[str], str, float]] = {}
 
-    def register(self, name: str, fn: callable, description: str = "", timeout: float = 300.0) -> None:
+    def register(self, name: str, fn: callable, *, description: str | None = None, timeout: float = 300.0) -> None:
         """Register an async callable under the given name.
         Args:
             name: Name the kernel stub will be callable as.
             fn: Async callable to execute on the host when the stub is invoked.
-            description: Human-readable description for the system prompt.
+            description: Override for the system prompt description. If None,
+                         the function's docstring is used.
             timeout: HTTP timeout in seconds for the kernel-side stub (default 300).
         """
         if not asyncio.iscoroutinefunction(fn):
             raise TypeError(f"{name}: host functions must be async")
         sig = inspect.signature(fn)
         param_names = [p.name for p in sig.parameters.values()]
-        self._functions[name] = (fn, param_names, description, timeout)
+        resolved_description = description if description is not None else (inspect.getdoc(fn) or "")
+        self._functions[name] = (fn, param_names, resolved_description, timeout)
 
     @property
     def names(self) -> list[str]:

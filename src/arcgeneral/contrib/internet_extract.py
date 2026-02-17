@@ -1,15 +1,6 @@
-"""internet_extract tool — fetch a web page or PDF and return its content as markdown.
+"""internet_extract — fetch a web page or PDF and return its content as markdown.
 
-Uses the Parallel API (parallel-web) to fetch, render, strip boilerplate,
-and convert HTML to markdown.  Two modes:
-
-- **Focused extraction** (default): provide `objective` and/or `search_queries`
-  to receive only the relevant excerpts.
-- **Full extraction**: set `full_content=True` to get the entire page as markdown.
-
-At least one of `objective`, `search_queries`, or `full_content=True` is required.
-
-Requires PARALLEL_API_KEY in the environment.
+Uses the Parallel API (parallel-web). Requires PARALLEL_API_KEY in the environment.
 """
 
 import json
@@ -22,34 +13,20 @@ from parallel import Parallel
 logger = logging.getLogger(__name__)
 
 
-
-
-async def execute_internet_extract(
+async def execute(
     url: str,
     objective: str = "",
     search_queries: str = "",
     full_content: bool = False,
 ) -> str:
-    """Execute an internet_extract tool call. Returns a JSON string with the results.
+    """Fetch a web page or PDF and return its content as markdown.
 
-    Calls the Parallel API to fetch and extract content from the given URL.
-    In focused mode, returns relevant excerpts. In full mode, returns the
-    entire page content as markdown.
+    Two modes: focused (provide `objective` and/or `search_queries` for relevant excerpts) \
+or full (`full_content=True` for the entire page).
+    At least one of `objective`, `search_queries`, or `full_content=True` is required.
+    Returns a JSON string with keys: url, title, publish_date, and either excerpts or full_content.
 
-    Args:
-        url: Public URL to fetch.
-        objective: What information is needed. Guides excerpt selection.
-        search_queries: Semicolon-separated search terms.
-        full_content: If True, return full page content instead of excerpts.
-
-    Returns:
-        JSON string with keys: url, title, publish_date, and either
-        excerpts (focused mode) or full_content (full mode).
-
-    Raises:
-        RuntimeError: If the API key is missing, no extraction mode is specified,
-            or the Parallel API returns an error.
-    """
+    Example: page = await internet_extract(url='https://example.com/report.pdf', objective='key findings')"""
     api_key = os.environ.get("PARALLEL_API_KEY")
     if not api_key:
         raise RuntimeError("PARALLEL_API_KEY is not set")
@@ -108,3 +85,8 @@ async def execute_internet_extract(
     logger.info("internet_extract completed for %s", url)
 
     return json.dumps(output, ensure_ascii=False)
+
+
+def register(registry) -> None:
+    """Register internet_extract as a host function."""
+    registry.register("internet_extract", execute)

@@ -1,11 +1,6 @@
 """internet_search — search the web and return relevant excerpts with source URLs.
 
-Uses the Parallel API (parallel-web) to search the web. Returns results with
-URLs, titles, publish dates, and relevant excerpts as markdown.
-
-At least one of `objective` or `search_queries` is required; both recommended.
-
-Requires PARALLEL_API_KEY in the environment.
+Uses the Parallel API (parallel-web). Requires PARALLEL_API_KEY in the environment.
 """
 
 import json
@@ -18,7 +13,7 @@ from parallel import Parallel
 logger = logging.getLogger(__name__)
 
 
-async def execute_internet_search(
+async def execute(
     objective: str = "",
     search_queries: str = "",
     include_domains: str = "",
@@ -27,24 +22,13 @@ async def execute_internet_search(
 ) -> str:
     """Search the web and return relevant excerpts with source URLs.
 
-    Calls the Parallel API to search the web. Results include URLs, titles,
-    publish dates, and relevant excerpts formatted as markdown.
+    At least one of `objective` or `search_queries` required; both recommended.
+    Query syntax (semicolon-separated): AND, OR, "exact phrase", -exclude, wildcard*
+    Use `include_domains`/`exclude_domains` instead of site: operators in queries.
+    `after_date` (YYYY-MM-DD) is a soft signal — older results may still appear.
+    Returns a JSON string with key 'results', a list of {url, title, publish_date, excerpts}.
 
-    Args:
-        objective: What you need and why. Include task context and preferred sources.
-        search_queries: Semicolon-separated queries with optional boolean operators.
-        include_domains: Semicolon-separated domains to restrict results to.
-        exclude_domains: Semicolon-separated domains to exclude from results.
-        after_date: Prefer content after this date (YYYY-MM-DD). Soft signal.
-
-    Returns:
-        JSON string with key "results", a list of
-        {url, title, publish_date, excerpts}.
-
-    Raises:
-        RuntimeError: If the API key is missing, no search parameters are given,
-            or the Parallel API returns an error.
-    """
+    Example: results = await internet_search(objective='recent advances in fusion energy', search_queries='fusion energy 2025; tokamak breakthrough')"""
     api_key = os.environ.get("PARALLEL_API_KEY")
     if not api_key:
         raise RuntimeError("PARALLEL_API_KEY is not set")
@@ -103,3 +87,8 @@ async def execute_internet_search(
     logger.info("internet_search returned %d results", len(results))
 
     return json.dumps({"results": results}, ensure_ascii=False)
+
+
+def register(registry) -> None:
+    """Register internet_search as a host function."""
+    registry.register("internet_search", execute)
