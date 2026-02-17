@@ -14,7 +14,7 @@ from arcgeneral.llm import LLMClient, OpenRouterClient
 
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
-from arcgeneral.sandbox import ForkServer, Sandbox
+from arcgeneral.sandbox import ForkServer, LocalForkServer, Sandbox
 from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
 from arcgeneral.events import AgentEvent, RoundStart, ModelRequest, ModelResponse, ToolExecStart, ToolExecEnd, TurnEnd
 
@@ -48,7 +48,7 @@ When you have the final answer, respond to the user in plain text without callin
 code \u2014 never as separate tool calls.
 2. If code fails, read the traceback, fix the issue, and retry.
 3. Use `asyncio.gather()` to run independent tasks concurrently within a single python tool call.
-4. The working directory `/app/workspace/` is mounted from the host. Files you create or modify there are visible on the host, and vice versa.
+4. The working directory `{workspace_path}` is shared with the host. Files you create or modify there are visible on the host, and vice versa.
 5. If a package is not installed, run `subprocess.run(["uv", "pip", "install", "<package>"])` to install it. For system libraries, use `subprocess.run(["apt-get", "install", "-y", "<package>"])`.
 6. To save context space, only your latest user message and its tool interactions are shown in full \
 \u2014 earlier exchanges are condensed to user message + final response. Your complete history \
@@ -68,7 +68,7 @@ Print only what changed or a brief status, not raw output.
   # later call — all state from prior calls is still here
   print(summary(findings))
 
-For data too large to hold in variables, or that other agents need, write to `/app/workspace/`.
+For data too large to hold in variables, or that other agents need, write to `{workspace_path}`.
 Read it back in later calls rather than re-doing work.
 
 ### Scaling with Sub-agents
@@ -92,7 +92,7 @@ Then continue your own work — sub-agents are running in the background. When r
 
   r1, r2 = await asyncio.gather(await_result(t1), await_result(t2))
 
-- Sub-agents share `/app/workspace/` — use files to pass large data between agents.
+- Sub-agents share `{workspace_path}` — use files to pass large data between agents.
 - Principle of Monotonicity: a sub-agent's task MUST be strictly simpler than your own — delegate proper subtasks, never your entire goal.
 
 ### Effective delegation
@@ -227,16 +227,34 @@ class AgentRuntime:
             self._server = HostFunctionServer(self._registry)
             await self._server.__aenter__()
 
-        # Create temp spool dir and add as bind mount
+        # Create temp spool dir
         self._spool_dir = Path(tempfile.mkdtemp(prefix="arcgeneral_spool_"))
-        binds = dict(self._config.sandbox_binds)
-        binds[str(self._spool_dir)] = "spool"
-        # Start fork server (one container for all sessions)
-        self._fork_server = ForkServer(
-            tag=self._config.sandbox_image,
-            binds=binds,
-            host_function_server=self._server,
-        )
+        if self._config.sandbox_image:
+            # Docker mode: bind-mount workspace and spool into container
+            binds = dict(self._config.sandbox_binds)
+            binds[str(self._spool_dir)] = "spool"
+            self._fork_server = ForkServer(
+                tag=self._config.sandbox_image,
+                binds=binds,
+                host_function_server=self._server,
+            )
+            # Resolve paths as they appear inside the container
+            self._config.workspace_path = self._config.workspace_path or "/app/workspace/"
+            self._config.spool_path = self._config.spool_path or "/app/spool"
+        else:
+            # Local mode: fork server runs as a subprocess on the host
+            self._fork_server = LocalForkServer(
+                host_function_server=self._server,
+            )
+            # Resolve paths to real host directories
+            workspace_candidates = list(self._config.sandbox_binds.values())
+            if workspace_candidates:
+                # Use the first bind's host path as workspace
+                workspace_host = list(self._config.sandbox_binds.keys())[0]
+                self._config.workspace_path = self._config.workspace_path or workspace_host
+            else:
+                self._config.workspace_path = self._config.workspace_path or str(Path.cwd())
+            self._config.spool_path = self._config.spool_path or str(self._spool_dir)
         await self._fork_server.__aenter__()
 
         # Init LLM client (create default if none injected)
@@ -332,7 +350,11 @@ class AgentRuntime:
         messages: list = []
         system_prompt = config.system_prompt if config.system_prompt is not None else DEFAULT_SYSTEM_PROMPT
         functions_json = self._registry.build_schemas_json()
-        system_prompt = system_prompt.format(functions_json=functions_json)
+        system_prompt = system_prompt.format(
+            functions_json=functions_json,
+            workspace_path=config.workspace_path or "/app/workspace/",
+            spool_path=config.spool_path or "/app/spool",
+        )
         if extra_instructions:
             system_prompt += (
                 "\n\n## Your Role\n"
@@ -515,7 +537,7 @@ class AgentRuntime:
                         limit_lines=config.output_limit_lines,
                         limit_bytes=config.output_limit_bytes,
                         host_spool_dir=self._spool_dir,
-                        container_spool_dir="/app/spool",
+                        container_spool_dir=config.spool_path or "/app/spool",
                     )
                     self._emit(on_event, ToolExecEnd(agent_id=agent_label, tool_name=tc.function.name, elapsed_seconds=time.monotonic() - tool_start))
                     logger.info("[%s] [tool result] %s", agent_label, result)

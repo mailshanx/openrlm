@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from arcgeneral.agent import DEFAULT_SYSTEM_PROMPT
 from arcgeneral.config import AgentConfig
-from arcgeneral.sandbox import ForkServer, Sandbox
+from arcgeneral.sandbox import ForkServer, LocalForkServer, Sandbox
 from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
 from arcgeneral.host_functions import HostFunctionRegistry
 from arcgeneral.agent import AgentRuntime, Session
@@ -65,7 +65,7 @@ async def test_config_defaults():
         c.model == "openai/gpt-4o",
         c.api_key_env_var == "OPENROUTER_API_KEY",
         c.system_prompt is None,
-        c.sandbox_image == "arcgeneral:sandbox",
+        c.sandbox_image is None,
         c.code_timeout == 3600.0,
         c.max_tool_rounds == 50,
         c.temperature is None,
@@ -141,7 +141,7 @@ async def test_cli_parse_defaults():
         report("cli_message", args.message == "hello world")
         report("cli_default_model", isinstance(args.model, str) and len(args.model) > 0)
         report("cli_default_api_key_env", args.api_key_env_var == "OPENROUTER_API_KEY")
-        report("cli_default_image", args.image == "arcgeneral:sandbox")
+        report("cli_default_image", args.image is None)
         report("cli_default_timeout", args.timeout == 3600.0)
         report("cli_default_max_rounds", args.max_rounds == 50)
         report("cli_default_env_file", args.env_file == ".env")
@@ -1047,6 +1047,47 @@ async def test_cancellation_rolls_back_history():
             report("cancel_tool_pairs_match", True)  # no tool_calls, trivially consistent
 
         await runtime.close_session("test")
+
+
+async def test_local_forkserver_basic(sb):
+    r = await sb.execute("print(2 + 2)", timeout=10)
+    report("local_basic_output", r.strip() == "4", repr(r.strip()))
+
+
+async def test_local_forkserver_state_persists(sb):
+    await sb.execute("x = 42", timeout=10)
+    r = await sb.execute("print(x * 2)", timeout=10)
+    report("local_state_persists", r.strip() == "84", repr(r.strip()))
+
+
+async def test_local_forkserver_error_recovery(sb):
+    r1 = await sb.execute("1 / 0", timeout=10)
+    report("local_error_traceback", "ZeroDivisionError" in r1)
+    r2 = await sb.execute("print('recovered')", timeout=10)
+    report("local_error_recovery", r2.strip() == "recovered", repr(r2.strip()))
+
+
+async def test_local_forkserver_independent_namespaces(fs):
+    sb1 = await fs.create_sandbox()
+    sb2 = await fs.create_sandbox()
+    await sb1.execute("color = 'red'", timeout=10)
+    await sb2.execute("color = 'blue'", timeout=10)
+    r1 = await sb1.execute("print(color)", timeout=10)
+    r2 = await sb2.execute("print(color)", timeout=10)
+    ok = r1.strip() == "red" and r2.strip() == "blue"
+    report("local_independent_namespaces", ok, f"sb1={r1.strip()!r} sb2={r2.strip()!r}")
+    await sb1.close()
+    await sb2.close()
+
+
+async def test_local_forkserver_timeout(sb):
+    r = await sb.execute("import time; time.sleep(10)", timeout=2)
+    report("local_timeout", "timed out" in r.lower(), repr(r[:80]))
+
+
+async def test_local_forkserver_post_timeout_recovery(sb):
+    r = await sb.execute("print('recovered')", timeout=10)
+    report("local_post_timeout_recovery", r.strip() == "recovered", repr(r.strip()))
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -1111,6 +1152,20 @@ async def main():
         await test_forkserver_concurrent_execute(fs)
         await test_forkserver_sequential_reuse(fs)
         await test_sub_agent_task_serialization(fs)
+
+    print("\nLocal fork server tests (no Docker):")
+    async with LocalForkServer() as lfs:
+        lsb = await lfs.create_sandbox()
+
+        await test_local_forkserver_basic(lsb)
+        await test_local_forkserver_state_persists(lsb)
+        await test_local_forkserver_error_recovery(lsb)
+        await test_local_forkserver_timeout(lsb)
+        await test_local_forkserver_post_timeout_recovery(lsb)
+
+        await lsb.close()
+
+        await test_local_forkserver_independent_namespaces(lfs)
 
     print("\nHost function path tests (separate runtime):")
     await test_host_function_path_serialization()

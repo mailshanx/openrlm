@@ -50,12 +50,13 @@ import struct
 import sys
 import traceback
 
-DATA_PORT = 8888
-CONTROL_PORT = 8889
+DATA_PORT = int(os.environ.get("ARCGENERAL_DATA_PORT", 8888))
+CONTROL_PORT = int(os.environ.get("ARCGENERAL_CONTROL_PORT", 8889))
 
 # ── Pre-import expensive packages (before any fork) ──────────────────
 
-sys.path.append("/app")
+if os.path.isdir("/app"):
+    sys.path.append("/app")
 
 def _preload():
     """Import packages that agents commonly use. Called once in supervisor."""
@@ -421,8 +422,9 @@ def _sigchld_handler(signum, frame):
 # ── Main ─────────────────────────────────────────────────────────────
 
 async def _serve():
-    data_server = await asyncio.start_server(_handle_data, "0.0.0.0", DATA_PORT)
-    control_server = await asyncio.start_server(_handle_control, "0.0.0.0", CONTROL_PORT)
+    bind_host = os.environ.get("ARCGENERAL_BIND_HOST", "0.0.0.0")
+    data_server = await asyncio.start_server(_handle_data, bind_host, DATA_PORT)
+    control_server = await asyncio.start_server(_handle_control, bind_host, CONTROL_PORT)
     print(f"fork server ready on data={DATA_PORT} control={CONTROL_PORT}", flush=True)
     async with data_server, control_server:
         await asyncio.gather(

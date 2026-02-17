@@ -202,13 +202,13 @@ class HostFunctionServer:
             logger.error("Host function %s failed:\n%s", name, tb)
             return web.json_response({"error": str(e), "traceback": tb}, status=500)
 
-    def preamble_code(self) -> str:
+    def preamble_code(self, host: str = "host.docker.internal") -> str:
         """Generate Python source to inject into the kernel.
         Defines one stub function per registered host function. Each stub
         makes a synchronous HTTP POST to the host server and returns the
         deserialized result.
         """
-        base_url = f"http://host.docker.internal:{self.port}/call"
+        base_url = f"http://{host}:{self.port}/call"
         stubs = []
         for name, (fn, param_names, _, timeout) in self._registry._functions.items():
             sig = inspect.signature(fn)
