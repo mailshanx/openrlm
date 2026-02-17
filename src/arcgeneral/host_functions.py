@@ -145,6 +145,7 @@ class HostFunctionServer:
         entry = self._registry.get(name)
         if entry is None:
             return web.json_response({"error": f"Unknown function: {name}"}, status=404)
+        fn, _, _, _ = entry
         try:
             body = await request.json()
             kwargs = body.get("kwargs", {})

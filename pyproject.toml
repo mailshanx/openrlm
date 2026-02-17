@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "LLM agent with stateful IPython REPL tool"
 requires-python = ">=3.13"
 dependencies = [
-    "ipybox==0.6.2",
+    "aiodocker>=0.23.0",
     "openrouter>=0.6.0",
     "python-dotenv>=1.2.1",
     "parallel-web>=0.3.4",

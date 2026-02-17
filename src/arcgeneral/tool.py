@@ -76,7 +76,7 @@ async def execute_tool(
     timeout: float,
     limit_lines: int = 2000,
     limit_bytes: int = 50_000,
-    host_downloads_dir: Path | None = None,
+    host_workspace_dir: Path | None = None,
 ) -> str:
     """Dispatch a tool call. Returns the result string, truncated if needed."""
     if name != "python":
@@ -90,13 +90,13 @@ async def execute_tool(
         return "Error: no code provided in tool call arguments."
     result = await sandbox.execute(code, timeout=timeout)
 
-    if host_downloads_dir is not None:
+    if host_workspace_dir is not None:
         result = _truncate_and_spool(
             result,
             limit_lines=limit_lines,
             limit_bytes=limit_bytes,
-            host_spool_dir=host_downloads_dir / "temp",
-            container_spool_dir="/app/downloads/temp",
+            host_spool_dir=host_workspace_dir / ".arcgeneral_spool",
+            container_spool_dir="/app/workspace/.arcgeneral_spool",
         )
 
     return result

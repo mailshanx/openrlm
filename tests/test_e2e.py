@@ -3,7 +3,7 @@
 Tests everything except the agent loop (run_agent), which requires API keys.
 
 Requires Docker running and the arcgeneral:sandbox image built:
-    uv run python -m ipybox build -t arcgeneral:sandbox -d sandbox-deps.txt --root
+    python -c "from arcgeneral.ipybox.build import build; from pathlib import Path; build('arcgeneral:sandbox', Path('sandbox-deps.txt'))"
 
 Run:
     uv run python tests/test_e2e.py
@@ -12,11 +12,23 @@ Run:
 import asyncio
 import json
 import sys
+import os
+from dataclasses import dataclass
 
 from arcgeneral.agent import DEFAULT_SYSTEM_PROMPT
 from arcgeneral.config import AgentConfig
-from arcgeneral.sandbox import Sandbox
+from arcgeneral.sandbox import ForkServer, Sandbox
 from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
+from arcgeneral.host_functions import HostFunctionRegistry
+from arcgeneral.agent import AgentRuntime, Session
+from arcgeneral.events import (
+    RoundStart, ModelRequest, ModelResponse,
+    ToolExecStart, ToolExecEnd, TurnEnd,
+)
+from arcgeneral.llm import (
+    CompletionResponse, CompletionChoice, CompletionMessage,
+    ToolCall, ToolCallFunction, TokenUsage, OpenRouterClient,
+)
 
 TAG = "arcgeneral:sandbox"
 
@@ -122,7 +134,7 @@ async def test_cli_parse_defaults():
         report("cli_default_model", isinstance(args.model, str) and len(args.model) > 0)
         report("cli_default_api_key_env", args.api_key_env_var == "OPENROUTER_API_KEY")
         report("cli_default_image", args.image == "arcgeneral:sandbox")
-        report("cli_default_timeout", args.timeout == 420.0)
+        report("cli_default_timeout", args.timeout == 3600.0)
         report("cli_default_max_rounds", args.max_rounds == 50)
         report("cli_default_env_file", args.env_file == ".env")
         report("cli_default_verbose", args.verbose is False)
@@ -255,31 +267,6 @@ async def test_sandbox_pandas(sb: Sandbox):
     report("sandbox_pandas", "6" in result, repr(result))
 
 
-async def test_sandbox_matplotlib_import(sb: Sandbox):
-    result = await sb.execute("import matplotlib; print(matplotlib.__version__)")
-    report("sandbox_matplotlib", result.strip() != "" and "Error" not in result, repr(result[:60]))
-
-
-async def test_sandbox_scipy(sb: Sandbox):
-    result = await sb.execute("from scipy import constants; print(int(constants.c))")
-    report("sandbox_scipy", "299792458" in result, repr(result))
-
-
-async def test_sandbox_scikit_learn(sb: Sandbox):
-    result = await sb.execute("import sklearn; print(sklearn.__version__)")
-    report("sandbox_sklearn", result.strip() != "" and "Error" not in result, repr(result[:60]))
-
-
-async def test_sandbox_seaborn(sb: Sandbox):
-    result = await sb.execute("import seaborn; print(seaborn.__version__)")
-    report("sandbox_seaborn", result.strip() != "" and "Error" not in result, repr(result[:60]))
-
-
-async def test_sandbox_pillow(sb: Sandbox):
-    result = await sb.execute("from PIL import Image; print(Image.__name__)")
-    report("sandbox_pillow", "Image" in result, repr(result[:60]))
-
-
 async def test_sandbox_requests(sb: Sandbox):
     result = await sb.execute("import requests; print(requests.__version__)")
     report("sandbox_requests", result.strip() != "" and "Error" not in result, repr(result[:60]))
@@ -296,7 +283,7 @@ async def test_sandbox_empty_code(sb: Sandbox):
 
 
 async def test_sandbox_expression_result(sb: Sandbox):
-    """IPython prints the result of a bare expression."""
+    """IPython-style: bare expression prints its result."""
     result = await sb.execute("2 ** 10")
     report("sandbox_expression_result", "1024" in result, repr(result))
 
@@ -305,6 +292,559 @@ async def test_sandbox_timeout(sb: Sandbox):
     result = await sb.execute("import time; time.sleep(10)", timeout=2)
     report("sandbox_timeout", "timed out" in result.lower() or "Timeout" in result, repr(result[:80]))
 
+
+async def test_sandbox_post_timeout_recovery(sb: Sandbox):
+    """After a timeout, the sandbox should still work."""
+    await sb.execute("import time; time.sleep(10)", timeout=2)
+    result = await sb.execute("print('recovered')")
+    report("sandbox_post_timeout_recovery", "recovered" in result, repr(result))
+
+
+async def test_sandbox_top_level_async(sb: Sandbox):
+    result = await sb.execute("import asyncio\nawait asyncio.sleep(0.01)\nprint('async ok')")
+    report("sandbox_top_level_async", "async ok" in result, repr(result))
+
+
+# ---------------------------------------------------------------------------
+# Fork server tests (multi-agent, requires Docker)
+# ---------------------------------------------------------------------------
+
+async def test_forkserver_independent_namespaces(fs: ForkServer):
+    """Two sandboxes have independent state."""
+    sb1 = await fs.create_sandbox()
+    sb2 = await fs.create_sandbox()
+    await sb1.execute("color = 'red'")
+    await sb2.execute("color = 'blue'")
+    r1 = await sb1.execute("print(color)")
+    r2 = await sb2.execute("print(color)")
+    report("forkserver_independent_namespaces",
+           r1.strip() == "red" and r2.strip() == "blue",
+           f"sb1={r1.strip()!r} sb2={r2.strip()!r}")
+    await sb1.close()
+    await sb2.close()
+
+
+async def test_forkserver_preloaded_imports(fs: ForkServer):
+    """Pre-imported packages are available instantly."""
+    sb = await fs.create_sandbox()
+    r1 = await sb.execute("import numpy as np; print(np.__version__)")
+    r2 = await sb.execute("import pandas as pd; print(pd.__version__)")
+    report("forkserver_preloaded_numpy", r1.strip() != "" and "Error" not in r1, repr(r1[:60]))
+    report("forkserver_preloaded_pandas", r2.strip() != "" and "Error" not in r2, repr(r2[:60]))
+    await sb.close()
+
+
+async def test_forkserver_interrupt_isolation(fs: ForkServer):
+    """Interrupting one sandbox doesn't affect another."""
+    sb1 = await fs.create_sandbox()
+    sb2 = await fs.create_sandbox()
+    # Timeout sb1
+    await sb1.execute("import time; time.sleep(999)", timeout=2)
+    # sb2 should still work
+    r = await sb2.execute("print('unaffected')")
+    report("forkserver_interrupt_isolation", "unaffected" in r, repr(r))
+    # sb1 should recover
+    r = await sb1.execute("print('recovered')")
+    report("forkserver_interrupt_recovery", "recovered" in r, repr(r))
+    await sb1.close()
+    await sb2.close()
+
+
+async def test_forkserver_destroy_respawn(fs: ForkServer):
+    """Destroying a sandbox and creating a new one works."""
+    sb = await fs.create_sandbox()
+    await sb.execute("x = 42")
+    await sb.close()
+    sb2 = await fs.create_sandbox()
+    r = await sb2.execute("print('fresh')")
+    report("forkserver_destroy_respawn", "fresh" in r, repr(r))
+    await sb2.close()
+
+
+async def test_forkserver_pip_install_shared(fs: ForkServer):
+    """pip install in one sandbox is visible to others (shared site-packages)."""
+    sb1 = await fs.create_sandbox()
+    sb2 = await fs.create_sandbox()
+    await sb1.execute("import subprocess; subprocess.check_call(['pip', 'install', '-q', 'six'])", timeout=30)
+    r = await sb2.execute("import six; print(six.__version__)")
+    report("forkserver_pip_install_shared", r.strip() != "" and "Error" not in r, repr(r[:60]))
+    await sb1.close()
+    await sb2.close()
+
+async def test_forkserver_concurrent_execute(fs: ForkServer):
+    """Two sandboxes can execute code concurrently without deadlocking."""
+    sb1 = await fs.create_sandbox()
+    sb2 = await fs.create_sandbox()
+    r1, r2 = await asyncio.gather(
+        sb1.execute("import time; time.sleep(0.5); print('alpha')"),
+        sb2.execute("import time; time.sleep(0.5); print('bravo')"),
+    )
+    report("forkserver_concurrent_execute",
+           "alpha" in r1 and "bravo" in r2,
+           f"r1={r1.strip()!r} r2={r2.strip()!r}")
+    await sb1.close()
+    await sb2.close()
+
+
+async def test_forkserver_sequential_reuse(fs: ForkServer):
+    """A persistent sandbox retains state across sequential execute calls."""
+    sb = await fs.create_sandbox()
+    await sb.execute("saved_data = {'key': 'value_from_first_task'}")
+    r = await sb.execute("print(saved_data['key'])")
+    report("forkserver_sequential_reuse",
+           "value_from_first_task" in r,
+           repr(r.strip()))
+    await sb.close()
+
+async def test_sub_agent_task_serialization(fs: ForkServer):
+    """Concurrent multi-step tasks on the same sandbox, protected by a lock,
+    do not interleave — each task's steps run as a contiguous block.
+    This mirrors the _SubAgent.lock in agent.py."""
+    sb = await fs.create_sandbox()
+    lock = asyncio.Lock()
+
+    async def multi_step_task(label):
+        async with lock:
+            await sb.execute(f"order.append('{label}_start')")
+            await sb.execute("import time; time.sleep(0.3)")
+            await sb.execute(f"order.append('{label}_end')")
+
+    await sb.execute("order = []")
+    await asyncio.gather(multi_step_task("a"), multi_step_task("b"))
+    r = await sb.execute("print(order)")
+
+    # Each task's _start/_end must be adjacent — no interleaving.
+    # Either a ran first or b ran first; both are valid.
+    ok = ("['a_start', 'a_end', 'b_start', 'b_end']" in r or
+          "['b_start', 'b_end', 'a_start', 'a_end']" in r)
+    report("sub_agent_task_serialization", ok, repr(r.strip()))
+    await sb.close()
+
+async def test_host_function_path_serialization():
+    """Full path: parent sandbox code → host function HTTP bridge →
+    _host_create_agent / _host_run_agent (with sub.lock) → _ensure_sandbox →
+    sub-agent sandbox.execute → _host_await_result.
+
+    Verifies that two concurrent run_agent calls on the same sub-agent are
+    serialized end-to-end, not just at the fork server level.
+    """
+    import os
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry)
+
+    # Replace _run_turn: skip LLM, just execute the task string as code.
+    async def _mock_run_turn(full_history, sandbox, config, request_kwargs, agent_label="", on_event=None):
+        task = full_history[-1]["content"]
+        result = await sandbox.execute(task, timeout=30.0)
+        full_history.append({"role": "assistant", "content": result})
+        return result
+    runtime._run_turn = _mock_run_turn
+
+    async with runtime:
+        session = await runtime.create_session()
+        sb = session._sandbox
+        # Step 1: basic sandbox works
+        r = await sb.execute("print('hello')", timeout=10)
+        print(f"    step1 basic: {r.strip()!r}")
+
+        # Step 2: host function bridge works
+        r = await sb.execute("aid = await create_agent('test'); print(aid)", timeout=30)
+        print(f"    step2 create_agent: {r.strip()!r}")
+
+        # Step 3: run_agent + await_result work
+        r = await sb.execute("tid = await run_agent(agent_id=aid, task=\"print('sub-hello')\")", timeout=30)
+        print(f"    step3 run_agent: {r.strip()!r}")
+        r = await sb.execute("res = await await_result(tid); print(res)", timeout=30)
+        print(f"    step4 await_result: {r.strip()!r}")
+
+        # Step 5: serialization test
+        code = '''t0 = await run_agent(agent_id=aid, task="order = []")
+await await_result(t0)
+t1 = await run_agent(agent_id=aid, task="order.append('t1_start'); import time; time.sleep(0.3); order.append('t1_end')")
+t2 = await run_agent(agent_id=aid, task="order.append('t2_start'); import time; time.sleep(0.3); order.append('t2_end')")
+import asyncio
+r1, r2 = await asyncio.gather(await_result(t1), await_result(t2))
+t3 = await run_agent(agent_id=aid, task="print(order)")
+r3 = await await_result(t3)
+print(r3)
+'''
+        result = await sb.execute(code, timeout=60.0)
+        ok = ("['t1_start', 't1_end', 't2_start', 't2_end']" in result or
+              "['t2_start', 't2_end', 't1_start', 't1_end']" in result)
+        report("host_function_path_serialization", ok, repr(result.strip()[-80:]))
+
+
+# ---------------------------------------------------------------------------
+# Mock LLM response helpers (duck-typed to match OpenRouter SDK shapes)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _MFn:
+    name: str
+    arguments: str
+
+@dataclass
+class _MTC:
+    id: str
+    function: _MFn
+
+@dataclass
+class _MMsg:
+    content: str | None
+    tool_calls: list | None
+
+@dataclass
+class _MUsage:
+    prompt_tokens: float
+    completion_tokens: float
+
+@dataclass
+class _MChoice:
+    message: _MMsg
+    finish_reason: str
+
+@dataclass
+class _MResp:
+    model: str
+    choices: list
+    usage: _MUsage
+
+
+_tc_counter = 0
+
+def _text_resp(text, pt=100, ct=50):
+    return _MResp("test/mock", [_MChoice(_MMsg(text, None), "stop")], _MUsage(pt, ct))
+
+def _tool_resp(code, reasoning=None, pt=100, ct=50):
+    global _tc_counter
+    _tc_counter += 1
+    tc = _MTC(f"call_{_tc_counter}", _MFn("python", json.dumps({"code": code})))
+    return _MResp("test/mock", [_MChoice(_MMsg(reasoning, [tc]), "tool_calls")], _MUsage(pt, ct))
+
+def check(name, fn, detail=""):
+    """Evaluate fn(); report FAIL on any exception instead of crashing."""
+    try:
+        ok = fn()
+    except Exception as e:
+        ok = False
+        if not detail:
+            detail = type(e).__name__ + ": " + str(e)
+    report(name, ok, detail)
+
+
+# ---------------------------------------------------------------------------
+# Event emission tests (requires Docker, mock LLM)
+# ---------------------------------------------------------------------------
+
+async def test_event_emission_two_rounds():
+    """_run_turn emits correct events for tool-call round + final response.
+
+    Mock LLM returns:
+      Round 0: tool_call with code 'print(2+2)'
+      Round 1: text response 'The answer is 4'
+
+    Expected 9 events in order:
+      RoundStart(0) ModelRequest ModelResponse(tool_calls=True)
+      ToolExecStart  ToolExecEnd
+      RoundStart(1) ModelRequest ModelResponse(tool_calls=False)
+      TurnEnd(rounds=2)
+    """
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry)
+
+    responses = [_tool_resp("print(2+2)", pt=100, ct=50), _text_resp("The answer is 4", pt=120, ct=60)]
+    async def mock_llm(messages, request_kwargs):
+        return responses.pop(0)
+
+    async with runtime:
+        session = await runtime.create_session()
+        events = []
+        runtime._llm_call = mock_llm
+        messages = list(session._messages)
+        messages.append({"role": "user", "content": "What is 2+2?"})
+        result = await runtime._run_turn(
+            messages, session._sandbox, runtime._config,
+            session._request_kwargs, agent_label="main",
+            on_event=events.append
+        )
+
+        check("event_count_9", lambda: len(events) == 9, f"got {len(events)}")
+        # Round 0
+        check("event_r0_start", lambda: isinstance(events[0], RoundStart) and events[0].round_num == 0 and events[0].agent_id == "main")
+        check("event_r0_request", lambda: isinstance(events[1], ModelRequest) and events[1].agent_id == "main")
+        check("event_r0_response", lambda: isinstance(events[2], ModelResponse) and events[2].has_tool_calls and events[2].model == "test/mock")
+        check("event_tool_start", lambda: isinstance(events[3], ToolExecStart) and "print(2+2)" in events[3].code and events[3].agent_id == "main")
+        check("event_tool_end", lambda: isinstance(events[4], ToolExecEnd) and events[4].elapsed_seconds >= 0 and events[4].agent_id == "main")
+        # Round 1
+        check("event_r1_start", lambda: isinstance(events[5], RoundStart) and events[5].round_num == 1)
+        check("event_r1_response", lambda: isinstance(events[7], ModelResponse) and not events[7].has_tool_calls)
+        # TurnEnd
+        check("event_turn_end", lambda: isinstance(events[8], TurnEnd) and events[8].rounds == 2)
+        check("event_turn_tokens", lambda: events[8].prompt_tokens == 220 and events[8].completion_tokens == 110)
+        check("event_turn_timing", lambda: events[8].elapsed_seconds > 0)
+        check("event_return_value", lambda: result == "The answer is 4")
+
+
+async def test_event_emission_immediate():
+    """_run_turn emits 4 events when LLM responds immediately (no tool calls)."""
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry)
+
+    async def mock_llm(messages, request_kwargs):
+        return _text_resp("Hello!")
+
+    async with runtime:
+        session = await runtime.create_session()
+        events = []
+        runtime._llm_call = mock_llm
+        messages = list(session._messages)
+        messages.append({"role": "user", "content": "Hi"})
+        result = await runtime._run_turn(
+            messages, session._sandbox, runtime._config,
+            session._request_kwargs, agent_label="main",
+            on_event=events.append
+        )
+
+        check("event_imm_count_4", lambda: len(events) == 4, f"got {len(events)}")
+        check("event_imm_round_start", lambda: isinstance(events[0], RoundStart) and events[0].round_num == 0)
+        check("event_imm_model_req", lambda: isinstance(events[1], ModelRequest))
+        check("event_imm_model_resp", lambda: isinstance(events[2], ModelResponse) and not events[2].has_tool_calls)
+        check("event_imm_turn_end", lambda: isinstance(events[3], TurnEnd) and events[3].rounds == 1)
+        check("event_imm_result", lambda: result == "Hello!")
+
+
+async def test_event_callback_error_isolation():
+    """A broken event callback must not crash _run_turn."""
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry)
+
+    async def mock_llm(messages, request_kwargs):
+        return _text_resp("Survived")
+
+    async with runtime:
+        session = await runtime.create_session()
+        def exploding_callback(event):
+            raise ValueError("consumer bug")
+        runtime._llm_call = mock_llm
+        messages = list(session._messages)
+        messages.append({"role": "user", "content": "Test"})
+        result = await runtime._run_turn(
+            messages, session._sandbox, runtime._config,
+            session._request_kwargs, agent_label="main",
+            on_event=exploding_callback
+        )
+        check("event_error_isolation", lambda: result == "Survived")
+
+
+async def test_event_no_callback():
+    """_run_turn works identically when _on_event is None (backward compat)."""
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry)
+
+    async def mock_llm(messages, request_kwargs):
+        return _text_resp("No events")
+
+    async with runtime:
+        session = await runtime.create_session()
+        runtime._llm_call = mock_llm
+        messages = list(session._messages)
+        messages.append({"role": "user", "content": "Test"})
+        result = await runtime._run_turn(
+            messages, session._sandbox, runtime._config,
+            session._request_kwargs, agent_label="main"
+        )
+        check("event_no_callback", lambda: result == "No events")
+
+
+async def test_event_sub_agent_propagation():
+    """Events from sub-agent _run_turn appear in the same stream with correct agent_id.
+
+    Mock LLM returns 3 responses in deterministic order:
+      1. Main agent: tool_call with code that creates/runs/awaits a sub-agent
+      2. Sub-agent: text response (the sub-agent's _run_turn calls _llm_call)
+      3. Main agent: text response (after tool execution completes)
+
+    Expected event sequence (13 events):
+      Main  RoundStart(0)  ModelRequest  ModelResponse(tool_calls)
+      Main  ToolExecStart
+        Sub RoundStart(0) ModelRequest ModelResponse(no_tools) TurnEnd
+      Main  ToolExecEnd
+      Main  RoundStart(1) ModelRequest ModelResponse(no_tools) TurnEnd
+    """
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry)
+
+    sub_agent_code = """aid = await create_agent(instructions='helper')
+tid = await run_agent(agent_id=aid, task='Say hello')
+result = await await_result(tid)
+print(f'sub says: {result}')"""
+
+    responses = [
+        _tool_resp(sub_agent_code),     # main agent round 0
+        _text_resp("Hello from sub"),   # sub-agent round 0
+        _text_resp("All done"),         # main agent round 1
+    ]
+    async def mock_llm(messages, request_kwargs):
+        return responses.pop(0)
+
+    async with runtime:
+        events = []
+        session = await runtime.create_session(on_event=events.append)
+        runtime._llm_call = mock_llm
+        messages = list(session._messages)
+        messages.append({"role": "user", "content": "Use a sub-agent"})
+        result = await runtime._run_turn(
+            messages, session._sandbox, runtime._config,
+            session._request_kwargs, agent_label="main",
+            on_event=session._on_event
+        )
+
+        check("event_sub_count_13", lambda: len(events) == 13, f"got {len(events)}")
+        check("event_sub_return", lambda: result == "All done")
+        # Identify main vs sub events
+        main_events = [e for e in events if getattr(e, 'agent_id', None) == "main"]
+        sub_events = [e for e in events if getattr(e, 'agent_id', None) not in ("main", None)]
+        check("event_sub_main_count", lambda: len(main_events) == 9, f"main={len(main_events)}")
+        check("event_sub_sub_count", lambda: len(sub_events) == 4, f"sub={len(sub_events)}")
+        # Sub-agent events should have consistent agent_id (a UUID, not "main")
+        sub_ids = set(getattr(e, 'agent_id', None) for e in sub_events)
+        check("event_sub_single_id", lambda: len(sub_ids) == 1 and "main" not in sub_ids,
+               f"sub_ids={sub_ids}")
+        check("event_sub_inside_tool", lambda: (
+               tool_start_idx := next((i for i, e in enumerate(events) if isinstance(e, ToolExecStart)), -1),
+               tool_end_idx := next((i for i, e in enumerate(events) if isinstance(e, ToolExecEnd)), -1),
+               sub_idx := [i for i, e in enumerate(events) if getattr(e, 'agent_id', None) not in ("main", None)],
+               tool_start_idx >= 0 and tool_end_idx >= 0 and all(tool_start_idx < i < tool_end_idx for i in sub_idx)
+        )[-1])
+        # Sub-agent should have its own TurnEnd
+        check("event_sub_turn_end", lambda: (
+               sub_te := [e for e in sub_events if isinstance(e, TurnEnd)],
+               len(sub_te) == 1 and sub_te[0].rounds == 1
+        )[-1])
+
+
+# ---------------------------------------------------------------------------
+# LLM client protocol tests
+# ---------------------------------------------------------------------------
+
+async def test_openrouter_client_converts_text_response():
+    """OpenRouterClient.complete() converts SDK text response to our frozen types."""
+    client = OpenRouterClient.__new__(OpenRouterClient)
+    raw_resp = _MResp("gpt-4o", [_MChoice(_MMsg("hello world", None), "stop")], _MUsage(100, 50))
+    class _MockChat:
+        async def send_async(self, **kw):
+            return raw_resp
+
+    class _MockSDK:
+        chat = _MockChat()
+
+    client._sdk = _MockSDK()
+    result = await client.complete(messages=[{"role": "user", "content": "hi"}], model="test")
+    report("llm_text_is_completion_response", isinstance(result, CompletionResponse))
+    report("llm_text_model", result.model == "gpt-4o")
+    report("llm_text_content", result.choices[0].message.content == "hello world")
+    report("llm_text_no_tool_calls", result.choices[0].message.tool_calls is None)
+    report("llm_text_finish_reason", result.choices[0].finish_reason == "stop")
+    report("llm_text_usage", result.usage == TokenUsage(prompt_tokens=100, completion_tokens=50))
+    report("llm_text_frozen", result.__dataclass_params__.frozen)
+
+async def test_openrouter_client_converts_tool_response():
+    """OpenRouterClient.complete() converts SDK tool-call response to our frozen types."""
+    client = OpenRouterClient.__new__(OpenRouterClient)
+    raw_resp = _tool_resp("print(42)", reasoning="thinking", pt=200, ct=80)
+    class _MockChat:
+        async def send_async(self, **kw):
+            return raw_resp
+
+    class _MockSDK:
+        chat = _MockChat()
+
+    client._sdk = _MockSDK()
+    result = await client.complete(messages=[], model="test")
+    report("llm_tool_has_tool_calls", result.choices[0].message.tool_calls is not None)
+    tc = result.choices[0].message.tool_calls[0]
+    report("llm_tool_call_type", isinstance(tc, ToolCall))
+    report("llm_tool_fn_name", tc.function.name == "python")
+    report("llm_tool_fn_args", '"print(42)"' in tc.function.arguments)
+    report("llm_tool_usage", result.usage == TokenUsage(prompt_tokens=200, completion_tokens=80))
+
+async def test_llm_client_injection():
+    """AgentRuntime uses an injected LLMClient instead of creating a default."""
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+    calls = []
+
+    class MockClient:
+        async def complete(self, messages, **kwargs):
+            calls.append(kwargs.get("model", "?"))
+            return CompletionResponse(
+                model="injected/mock",
+                choices=[CompletionChoice(
+                    message=CompletionMessage(content="from injected", tool_calls=None),
+                    finish_reason="stop",
+                )],
+                usage=TokenUsage(prompt_tokens=10, completion_tokens=5),
+            )
+        async def close(self):
+            pass
+
+    config = AgentConfig(model="injected-model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=MockClient())
+
+    async with runtime:
+        result = await runtime.run_single("test injection")
+
+    report("llm_injection_used", len(calls) == 1 and calls[0] == "injected-model")
+    report("llm_injection_result", result == "from injected")
+
+async def test_llm_client_lifecycle_ownership():
+    """Injected client is NOT closed on __aexit__; default client IS closed."""
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+    closed = []
+
+    class TrackingClient:
+        async def complete(self, messages, **kwargs):
+            return CompletionResponse(
+                model="tracking",
+                choices=[CompletionChoice(
+                    message=CompletionMessage(content="ok", tool_calls=None),
+                    finish_reason="stop",
+                )],
+                usage=TokenUsage(prompt_tokens=1, completion_tokens=1),
+            )
+        async def close(self):
+            closed.append(True)
+
+    config = AgentConfig(model="test", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    injected = TrackingClient()
+    runtime = AgentRuntime(config, registry, llm_client=injected)
+
+    async with runtime:
+        await runtime.run_single("test lifecycle")
+
+    report("llm_injected_not_closed", len(closed) == 0)
+
+    # Verify the runtime knows it doesn't own the client
+    report("llm_owns_flag_false", not runtime._owns_llm_client)
 
 # ---------------------------------------------------------------------------
 # Runner
@@ -327,8 +867,10 @@ async def main():
     await test_cli_parse_defaults()
     await test_cli_parse_overrides()
 
-    print("\nSandbox tests (starting container...):")
-    async with Sandbox(tag=TAG) as sb:
+    print("\nSandbox tests (starting fork server...):")
+    async with ForkServer(tag=TAG) as fs:
+        sb = await fs.create_sandbox()
+
         await test_sandbox_basic_output(sb)
         await test_sandbox_no_output(sb)
         await test_sandbox_state_persists(sb)
@@ -342,22 +884,48 @@ async def main():
         await test_sandbox_error_does_not_poison_state(sb)
         await test_sandbox_numpy(sb)
         await test_sandbox_pandas(sb)
-        await test_sandbox_matplotlib_import(sb)
-        await test_sandbox_scipy(sb)
-        await test_sandbox_scikit_learn(sb)
-        await test_sandbox_seaborn(sb)
-        await test_sandbox_pillow(sb)
         await test_sandbox_requests(sb)
         await test_sandbox_large_output(sb)
         await test_sandbox_empty_code(sb)
         await test_sandbox_expression_result(sb)
         await test_sandbox_timeout(sb)
+        await test_sandbox_post_timeout_recovery(sb)
+        await test_sandbox_top_level_async(sb)
+
+        await sb.close()
 
         print("\nTool dispatch tests:")
-        await test_tool_execute_python(sb)
-        await test_tool_execute_unknown(sb)
-        await test_tool_execute_error_propagates(sb)
+        sb2 = await fs.create_sandbox()
+        await test_tool_execute_python(sb2)
+        await test_tool_execute_unknown(sb2)
+        await test_tool_execute_error_propagates(sb2)
+        await sb2.close()
 
+        print("\nFork server tests:")
+        await test_forkserver_independent_namespaces(fs)
+        await test_forkserver_preloaded_imports(fs)
+        await test_forkserver_interrupt_isolation(fs)
+        await test_forkserver_destroy_respawn(fs)
+        await test_forkserver_pip_install_shared(fs)
+        await test_forkserver_concurrent_execute(fs)
+        await test_forkserver_sequential_reuse(fs)
+        await test_sub_agent_task_serialization(fs)
+
+    print("\nHost function path tests (separate runtime):")
+    await test_host_function_path_serialization()
+
+    print("\nEvent emission tests (separate runtimes, mock LLM):")
+    await test_event_emission_two_rounds()
+    await test_event_emission_immediate()
+    await test_event_callback_error_isolation()
+    await test_event_no_callback()
+    await test_event_sub_agent_propagation()
+
+    print("\nLLM client protocol tests:")
+    await test_openrouter_client_converts_text_response()
+    await test_openrouter_client_converts_tool_response()
+    await test_llm_client_injection()
+    await test_llm_client_lifecycle_ownership()
     total = passed_count + len(failures)
     print()
     if failures:

@@ -13,6 +13,7 @@ from arcgeneral.host_functions import HostFunctionRegistry
 from arcgeneral.internet_extract import execute_internet_extract
 from arcgeneral.internet_search import execute_internet_search
 from arcgeneral.sandbox import cleanup_orphaned_containers
+from arcgeneral.agent import AgentRuntime
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,10 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default="z-ai/glm-5", help="Model name")
     parser.add_argument("--api-key-env-var", type=str, default="OPENROUTER_API_KEY", help="Env var name for API key")
     parser.add_argument("--image", type=str, default="arcgeneral:sandbox", help="Docker image tag for sandbox")
-    parser.add_argument("--timeout", type=float, default=420.0, help="Code execution timeout in seconds")
+    parser.add_argument("--timeout", type=float, default=3600.0, help="Code execution timeout in seconds")
     parser.add_argument("--max-rounds", type=int, default=50, help="Max tool loop iterations")
     parser.add_argument("--env-file", type=str, default=".env", help="Path to .env file")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("--workspace", type=str, default=None, help="Host directory to mount as /app/workspace/ (default: cwd)")
     parser.add_argument("--log-file", type=str, default=str(Path.home() / "Downloads" / "arcgeneral.log"), help="Log file path")
     return parser.parse_args()
 
@@ -42,6 +44,7 @@ def main():
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     arc_logger.addHandler(file_handler)
+    arc_logger.propagate = False
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -79,7 +82,7 @@ Example: results = await internet_search(objective='recent advances in fusion en
         sandbox_image=args.image,
         code_timeout=args.timeout,
         max_tool_rounds=args.max_rounds,
-        sandbox_binds={str(Path.home() / "Downloads"): "downloads"},
+        sandbox_binds={str(Path(args.workspace).resolve() if args.workspace else Path.cwd()): "workspace"},
     )
 
     # create_agent/run_agent are registered by AgentRuntime.__init__
@@ -89,15 +92,34 @@ Example: results = await internet_search(objective='recent advances in fusion en
         async def _run():
             await cleanup_orphaned_containers()
             async with runtime:
-                return await runtime.run_single(args.message)
+                session = await runtime.create_session()
+                result = await session.run_single(args.message)
+                await session.close()
+                return result
         print(asyncio.run(_run()))
     else:
         async def _session():
             await cleanup_orphaned_containers()
             async with runtime:
+                session = await runtime.create_session()
                 loop = asyncio.get_event_loop()
                 loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(runtime.__aexit__(None, None, None)))
-                await runtime.run_session()
+                print("arcgeneral session started. Type 'quit' or 'exit' to end.\n")
+                while True:
+                    try:
+                        user_input = input(">>> ")
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        break
+                    stripped = user_input.strip()
+                    if stripped.lower() in ("quit", "exit"):
+                        break
+                    if not stripped:
+                        continue
+                    result = await session.run_single(stripped)
+                    print(result)
+                    print()
+                await session.close()
         asyncio.run(_session())
 
 

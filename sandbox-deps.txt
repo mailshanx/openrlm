@@ -1,8 +1,5 @@
-"numpy",
-"pandas",
-"matplotlib",
-"scipy",
-"scikit-learn",
-"seaborn",
+"httpx[http2]",
 "requests",
-"pillow"
+"beautifulsoup4",
+"pandas",
+"numpy"
