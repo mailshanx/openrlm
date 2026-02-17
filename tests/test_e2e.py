@@ -951,6 +951,107 @@ async def test_sigterm_cancels_inflight_subtasks():
     report("sigterm_subtask_cancelled", len(cancelled) == 1)
     report("sigterm_tasks_cleared", len(session._running_tasks) == 0)
     report("sigterm_subagents_cleared", len(session._sub_agents) == 0)
+
+
+async def test_cancellation_rolls_back_history():
+    """When _run_turn is cancelled mid-round, full_history rolls back to
+    the checkpoint — no dangling assistant tool_calls without matching
+    tool results."""
+    os.environ.setdefault("OPENROUTER_API_KEY", "test-dummy-key")
+
+    call_count = 0
+
+    class CancellingClient:
+        """First call returns a tool_call. Second call hangs until cancelled."""
+        async def complete(self, messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Round 0: LLM wants to call a tool
+                return CompletionResponse(
+                    model="test",
+                    choices=[CompletionChoice(
+                        message=CompletionMessage(
+                            content=None,
+                            tool_calls=[ToolCall(
+                                id="tc_1",
+                                function=ToolCallFunction(
+                                    name="python",
+                                    arguments='{"code": "print(1)"}',
+                                ),
+                            )],
+                        ),
+                        finish_reason="tool_calls",
+                    )],
+                    usage=TokenUsage(prompt_tokens=10, completion_tokens=5),
+                )
+            # Round 1: hang forever (will be cancelled)
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            pass
+
+    config = AgentConfig(model="test", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    client = CancellingClient()
+    runtime = AgentRuntime(config, registry, llm_client=client)
+
+    async with runtime:
+        session = await runtime.create_session("test")
+        messages = session._messages
+        pre_count = len(messages)  # system prompt only
+
+        # Add user message
+        messages.append({"role": "user", "content": "test"})
+        history_before_turn = len(messages)  # system + user
+
+        # Start _run_turn as a task so we can cancel it
+        turn_task = asyncio.create_task(
+            runtime._run_turn(
+                messages, session._sandbox, config,
+                session._request_kwargs, agent_label="main",
+            )
+        )
+
+        # Let round 0 complete (tool call + tool exec) and round 1 start (LLM call hangs)
+        await asyncio.sleep(1.0)
+        report("cancel_round0_completed", call_count == 2)
+
+        # Round 0 added: assistant(tool_calls) + tool result = 2 messages
+        # Round 1 is in-flight (LLM call), no messages appended yet
+        history_after_round0 = len(messages)
+        report("cancel_history_grew", history_after_round0 > history_before_turn)
+
+        # Cancel during round 1 (hanging on _llm_call)
+        turn_task.cancel()
+        try:
+            await turn_task
+        except asyncio.CancelledError:
+            pass
+
+        # History should be rolled back to before round 1 started,
+        # which is after round 0 completed (round 0 was fully consistent).
+        # The checkpoint for round 1 = history_after_round0, so rollback
+        # deletes from there, leaving round 0 intact.
+        report("cancel_history_consistent", len(messages) == history_after_round0)
+
+        # Verify the last message pair is consistent: assistant with tool_calls
+        # followed by matching tool result
+        last_assistant = None
+        tool_ids = set()
+        for msg in messages[history_before_turn:]:
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                last_assistant = msg
+            elif msg.get("role") == "tool":
+                tool_ids.add(msg["tool_call_id"])
+
+        if last_assistant:
+            expected_ids = {tc["id"] for tc in last_assistant["tool_calls"]}
+            report("cancel_tool_pairs_match", expected_ids == tool_ids)
+        else:
+            report("cancel_tool_pairs_match", True)  # no tool_calls, trivially consistent
+
+        await runtime.close_session("test")
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -1035,6 +1136,7 @@ async def main():
     print("\nShutdown / SIGTERM tests:")
     await test_sigterm_clean_shutdown()
     await test_sigterm_cancels_inflight_subtasks()
+    await test_cancellation_rolls_back_history()
     total = passed_count + len(failures)
     print()
     if failures:

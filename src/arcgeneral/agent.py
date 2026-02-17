@@ -429,96 +429,108 @@ class AgentRuntime:
                 await asyncio.sleep(wait)
 
     async def _run_turn(self, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main", on_event=None) -> str:
-        """Run one turn of the agent loop (LLM calls + tool calls until stop). Returns the final text response."""
+        """Run one turn of the agent loop (LLM calls + tool calls until stop).
+
+        On CancelledError, rolls back full_history to the start of the
+        interrupted round so the message list stays consistent (every
+        assistant tool_calls entry has matching tool results).
+        """
         turn_start = time.monotonic()
         total_prompt_tokens = 0
         total_completion_tokens = 0
         for round_num in range(config.max_tool_rounds):
-            self._emit(on_event, RoundStart(agent_id=agent_label, round_num=round_num, max_rounds=config.max_tool_rounds))
-            compressed = self._compress_messages(full_history)
-            self._emit(on_event, ModelRequest(agent_id=agent_label))
-            response = await self._llm_call(compressed, request_kwargs)
+            checkpoint = len(full_history)
+            try:
+                self._emit(on_event, RoundStart(agent_id=agent_label, round_num=round_num, max_rounds=config.max_tool_rounds))
+                compressed = self._compress_messages(full_history)
+                self._emit(on_event, ModelRequest(agent_id=agent_label))
+                response = await self._llm_call(compressed, request_kwargs)
 
-            choice = response.choices[0]
-            msg = choice.message
-            u = response.usage
-            pt = int(u.prompt_tokens) if u and u.prompt_tokens else 0
-            ct = int(u.completion_tokens) if u and u.completion_tokens else 0
-            total_prompt_tokens += pt
-            total_completion_tokens += ct
-            self._emit(on_event, ModelResponse(
-                agent_id=agent_label, model=response.model or "",
-                finish_reason=choice.finish_reason or "",
-                has_tool_calls=bool(msg.tool_calls),
-                prompt_tokens=pt if u else None,
-                completion_tokens=ct if u else None,
-            ))
-            logger.info("[%s] [model=%s finish=%s tokens=%s]", agent_label, response.model, choice.finish_reason, f"{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}" if u else "?")
-            if msg.content:
-                logger.info("[%s] [LLM] %s", agent_label, msg.content)
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    raw_args = tc.function.arguments or "{}"
-                    try:
-                        args_pretty = json.loads(raw_args).get("code", raw_args)
-                    except (json.JSONDecodeError, AttributeError):
-                        args_pretty = raw_args
-                    logger.info("[%s] [tool call] %s:\n%s", agent_label, tc.function.name, args_pretty)
-
-            # Convert to dict for round-tripping back into messages
-            assistant_msg = {"role": "assistant"}
-            assistant_msg["content"] = msg.content or None
-            if msg.tool_calls:
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments or "{}",
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ]
-            full_history.append(assistant_msg)
-
-            if not msg.tool_calls:
-                await self._sync_history(sandbox, full_history)
-                self._emit(on_event, TurnEnd(
-                    agent_id=agent_label, rounds=round_num + 1,
-                    elapsed_seconds=time.monotonic() - turn_start,
-                    prompt_tokens=total_prompt_tokens,
-                    completion_tokens=total_completion_tokens,
+                choice = response.choices[0]
+                msg = choice.message
+                u = response.usage
+                pt = int(u.prompt_tokens) if u and u.prompt_tokens else 0
+                ct = int(u.completion_tokens) if u and u.completion_tokens else 0
+                total_prompt_tokens += pt
+                total_completion_tokens += ct
+                self._emit(on_event, ModelResponse(
+                    agent_id=agent_label, model=response.model or "",
+                    finish_reason=choice.finish_reason or "",
+                    has_tool_calls=bool(msg.tool_calls),
+                    prompt_tokens=pt if u else None,
+                    completion_tokens=ct if u else None,
                 ))
-                return msg.content or ""
+                logger.info("[%s] [model=%s finish=%s tokens=%s]", agent_label, response.model, choice.finish_reason, f"{u.prompt_tokens:.0f}+{u.completion_tokens:.0f}" if u else "?")
+                if msg.content:
+                    logger.info("[%s] [LLM] %s", agent_label, msg.content)
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        raw_args = tc.function.arguments or "{}"
+                        try:
+                            args_pretty = json.loads(raw_args).get("code", raw_args)
+                        except (json.JSONDecodeError, AttributeError):
+                            args_pretty = raw_args
+                        logger.info("[%s] [tool call] %s:\n%s", agent_label, tc.function.name, args_pretty)
 
-            for tc in msg.tool_calls:
-                raw_args_tc = tc.function.arguments or "{}"
-                try:
-                    code_text = json.loads(raw_args_tc).get("code", raw_args_tc)
-                except (json.JSONDecodeError, AttributeError):
-                    code_text = raw_args_tc
-                self._emit(on_event, ToolExecStart(agent_id=agent_label, tool_name=tc.function.name, code=code_text))
-                tool_start = time.monotonic()
-                result = await execute_tool(
-                    sandbox,
-                    tc.function.name,
-                    tc.function.arguments or "{}",
-                    timeout=config.code_timeout,
-                    limit_lines=config.output_limit_lines,
-                    limit_bytes=config.output_limit_bytes,
-                    host_spool_dir=self._spool_dir,
-                    container_spool_dir="/app/spool",
-                )
-                self._emit(on_event, ToolExecEnd(agent_id=agent_label, tool_name=tc.function.name, elapsed_seconds=time.monotonic() - tool_start))
-                logger.info("[%s] [tool result] %s", agent_label, result)
-                full_history.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
+                # Convert to dict for round-tripping back into messages
+                assistant_msg = {"role": "assistant"}
+                assistant_msg["content"] = msg.content or None
+                if msg.tool_calls:
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments or "{}",
+                            },
+                        }
+                        for tc in msg.tool_calls
+                    ]
+                full_history.append(assistant_msg)
 
-            await self._sync_history(sandbox, full_history)
+                if not msg.tool_calls:
+                    await self._sync_history(sandbox, full_history)
+                    self._emit(on_event, TurnEnd(
+                        agent_id=agent_label, rounds=round_num + 1,
+                        elapsed_seconds=time.monotonic() - turn_start,
+                        prompt_tokens=total_prompt_tokens,
+                        completion_tokens=total_completion_tokens,
+                    ))
+                    return msg.content or ""
+
+                for tc in msg.tool_calls:
+                    raw_args_tc = tc.function.arguments or "{}"
+                    try:
+                        code_text = json.loads(raw_args_tc).get("code", raw_args_tc)
+                    except (json.JSONDecodeError, AttributeError):
+                        code_text = raw_args_tc
+                    self._emit(on_event, ToolExecStart(agent_id=agent_label, tool_name=tc.function.name, code=code_text))
+                    tool_start = time.monotonic()
+                    result = await execute_tool(
+                        sandbox,
+                        tc.function.name,
+                        tc.function.arguments or "{}",
+                        timeout=config.code_timeout,
+                        limit_lines=config.output_limit_lines,
+                        limit_bytes=config.output_limit_bytes,
+                        host_spool_dir=self._spool_dir,
+                        container_spool_dir="/app/spool",
+                    )
+                    self._emit(on_event, ToolExecEnd(agent_id=agent_label, tool_name=tc.function.name, elapsed_seconds=time.monotonic() - tool_start))
+                    logger.info("[%s] [tool result] %s", agent_label, result)
+                    full_history.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+
+                await self._sync_history(sandbox, full_history)
+
+            except asyncio.CancelledError:
+                del full_history[checkpoint:]
+                logger.info("[%s] Cancelled during round %d, rolled back history to %d messages", agent_label, round_num, checkpoint)
+                raise
 
         self._emit(on_event, TurnEnd(
             agent_id=agent_label, rounds=config.max_tool_rounds,
