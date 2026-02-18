@@ -49,7 +49,7 @@ code \u2014 never as separate tool calls.
 2. If code fails, read the traceback, fix the issue, and retry.
 3. Use `asyncio.gather()` to run independent tasks concurrently within a single python tool call.
 4. The working directory `{workspace_path}` is shared with the host. Files you create or modify there are visible on the host, and vice versa.
-5. If a package is not installed, run `subprocess.run(["uv", "pip", "install", "<package>"])` to install it. For system libraries, use `subprocess.run(["apt-get", "install", "-y", "<package>"])`.
+5. If a package is not installed, run `subprocess.run(["uv", "pip", "install", "<package>"])` to install it.
 6. To save context space, only your latest user message and its tool interactions are shown in full \
 \u2014 earlier exchanges are condensed to user message + final response. Your complete history \
 including all tool calls, outputs, and errors is available as `_conversation_history` \u2014 a list \
