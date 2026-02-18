@@ -35,7 +35,7 @@ TAG = "arcgeneral:sandbox"
 
 class _NullClient:
     """Mock LLM client that raises if accidentally called."""
-    async def complete(self, messages, **kwargs):
+    async def complete(self, messages, *, api_key="", **kwargs):
         raise RuntimeError("_NullClient.complete() should never be called — mock _run_turn or _llm_call first")
     async def close(self):
         pass
@@ -63,7 +63,7 @@ async def test_config_defaults():
     c = AgentConfig()
     report("config_defaults", all([
         c.model == "openai/gpt-4o",
-        c.api_key_env_var == "OPENROUTER_API_KEY",
+        c.provider == "openrouter",
         c.system_prompt is None,
         c.sandbox_image is None,
         c.code_timeout == 3600.0,
@@ -75,7 +75,7 @@ async def test_config_defaults():
 async def test_config_override():
     c = AgentConfig(
         model="openai/gpt-4o-mini",
-        api_key_env_var="MY_KEY",
+        provider="anthropic",
         system_prompt="You are a cat.",
         sandbox_image="custom:latest",
         code_timeout=30.0,
@@ -84,7 +84,7 @@ async def test_config_override():
     )
     report("config_override", all([
         c.model == "openai/gpt-4o-mini",
-        c.api_key_env_var == "MY_KEY",
+        c.provider == "anthropic",
         c.system_prompt == "You are a cat.",
         c.sandbox_image == "custom:latest",
         c.code_timeout == 30.0,
@@ -140,7 +140,7 @@ async def test_cli_parse_defaults():
         args = parse_args()
         report("cli_message", args.message == "hello world")
         report("cli_default_model", isinstance(args.model, str) and len(args.model) > 0)
-        report("cli_default_api_key_env", args.api_key_env_var == "OPENROUTER_API_KEY")
+        report("cli_default_provider", args.provider == "openrouter")
         report("cli_default_image", args.image is None)
         report("cli_default_timeout", args.timeout == 3600.0)
         report("cli_default_max_rounds", args.max_rounds == 50)
@@ -158,7 +158,7 @@ async def test_cli_parse_overrides():
             "arcgeneral",
             "compute stuff",
             "--model", "openai/gpt-4o-mini",
-            "--api-key-env-var", "MY_KEY",
+            "--provider", "anthropic",
             "--image", "custom:v2",
             "--timeout", "30.5",
             "--max-rounds", "10",
@@ -168,7 +168,7 @@ async def test_cli_parse_overrides():
         args = parse_args()
         report("cli_override_message", args.message == "compute stuff")
         report("cli_override_model", args.model == "openai/gpt-4o-mini")
-        report("cli_override_api_key_env", args.api_key_env_var == "MY_KEY")
+        report("cli_override_provider", args.provider == "anthropic")
         report("cli_override_image", args.image == "custom:v2")
         report("cli_override_timeout", args.timeout == 30.5)
         report("cli_override_max_rounds", args.max_rounds == 10)
@@ -802,7 +802,8 @@ print(f'sub says: {result}')"""
 
 async def test_openrouter_client_converts_text_response():
     """OpenRouterClient.complete() converts SDK text response to our frozen types."""
-    client = OpenRouterClient.__new__(OpenRouterClient)
+    import unittest.mock as _mock
+    client = OpenRouterClient()
     raw_resp = _MResp("gpt-4o", [_MChoice(_MMsg("hello world", None), "stop")], _MUsage(100, 50))
     class _MockChat:
         async def send_async(self, **kw):
@@ -811,8 +812,8 @@ async def test_openrouter_client_converts_text_response():
     class _MockSDK:
         chat = _MockChat()
 
-    client._sdk = _MockSDK()
-    result = await client.complete(messages=[{"role": "user", "content": "hi"}], model="test")
+    with _mock.patch("openrouter.OpenRouter", lambda **kw: _MockSDK()):
+        result = await client.complete(messages=[{"role": "user", "content": "hi"}], api_key="test-key", model="test")
     report("llm_text_is_completion_response", isinstance(result, CompletionResponse))
     report("llm_text_model", result.model == "gpt-4o")
     report("llm_text_content", result.choices[0].message.content == "hello world")
@@ -820,10 +821,12 @@ async def test_openrouter_client_converts_text_response():
     report("llm_text_finish_reason", result.choices[0].finish_reason == "stop")
     report("llm_text_usage", result.usage == TokenUsage(prompt_tokens=100, completion_tokens=50))
     report("llm_text_frozen", result.__dataclass_params__.frozen)
+    await client.close()
 
 async def test_openrouter_client_converts_tool_response():
     """OpenRouterClient.complete() converts SDK tool-call response to our frozen types."""
-    client = OpenRouterClient.__new__(OpenRouterClient)
+    import unittest.mock as _mock
+    client = OpenRouterClient()
     raw_resp = _tool_resp("print(42)", reasoning="thinking", pt=200, ct=80)
     class _MockChat:
         async def send_async(self, **kw):
@@ -832,21 +835,22 @@ async def test_openrouter_client_converts_tool_response():
     class _MockSDK:
         chat = _MockChat()
 
-    client._sdk = _MockSDK()
-    result = await client.complete(messages=[], model="test")
+    with _mock.patch("openrouter.OpenRouter", lambda **kw: _MockSDK()):
+        result = await client.complete(messages=[], api_key="test-key", model="test")
     report("llm_tool_has_tool_calls", result.choices[0].message.tool_calls is not None)
     tc = result.choices[0].message.tool_calls[0]
     report("llm_tool_call_type", isinstance(tc, ToolCall))
     report("llm_tool_fn_name", tc.function.name == "python")
     report("llm_tool_fn_args", '"print(42)"' in tc.function.arguments)
     report("llm_tool_usage", result.usage == TokenUsage(prompt_tokens=200, completion_tokens=80))
+    await client.close()
 
 async def test_llm_client_injection():
     """AgentRuntime uses an injected LLMClient instead of creating a default."""
     calls = []
 
     class MockClient:
-        async def complete(self, messages, **kwargs):
+        async def complete(self, messages, *, api_key="", **kwargs):
             calls.append(kwargs.get("model", "?"))
             return CompletionResponse(
                 model="injected/mock",
@@ -875,7 +879,7 @@ async def test_llm_client_lifecycle_ownership():
     closed = []
 
     class TrackingClient:
-        async def complete(self, messages, **kwargs):
+        async def complete(self, messages, *, api_key="", **kwargs):
             return CompletionResponse(
                 model="tracking",
                 choices=[CompletionChoice(
@@ -911,7 +915,7 @@ async def test_sigterm_clean_shutdown():
     closed_llm = []
 
     class SlowClient:
-        async def complete(self, messages, **kwargs):
+        async def complete(self, messages, *, api_key="", **kwargs):
             return CompletionResponse(
                 model="test",
                 choices=[CompletionChoice(
@@ -1013,7 +1017,7 @@ async def test_cancellation_rolls_back_history():
 
     class CancellingClient:
         """First call returns a tool_call. Second call hangs until cancelled."""
-        async def complete(self, messages, **kwargs):
+        async def complete(self, messages, *, api_key="", **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:

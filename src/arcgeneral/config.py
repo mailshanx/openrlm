@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import Awaitable, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from arcgeneral.host_functions import HostFunctionRegistry
@@ -10,7 +10,8 @@ if TYPE_CHECKING:
 @dataclass
 class AgentConfig:
     model: str = "openai/gpt-4o"
-    api_key_env_var: str = "OPENROUTER_API_KEY"
+    provider: str = "openrouter"
+    get_api_key: Callable[[str], Awaitable[str]] | None = None
     system_prompt: str | None = None
     sandbox_image: str | None = None
     code_timeout: float = 3600.0

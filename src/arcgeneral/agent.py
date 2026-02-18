@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
-from arcgeneral.llm import LLMClient, OpenRouterClient
+from arcgeneral.llm import LLMClient, OpenRouterClient, default_api_key_resolver
 
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
@@ -277,12 +277,12 @@ class AgentRuntime:
             self._config.spool_path = self._config.spool_path or str(self._spool_dir)
         await self._fork_server.__aenter__()
 
+        # Init API key resolver (default reads from env vars)
+        if self._config.get_api_key is None:
+            self._config.get_api_key = default_api_key_resolver(self._config.provider)
         # Init LLM client (create default if none injected)
         if self._llm_client is None:
-            api_key = os.environ.get(self._config.api_key_env_var)
-            if api_key is None:
-                raise ValueError(f"{self._config.api_key_env_var} is not set")
-            self._llm_client = OpenRouterClient(api_key=api_key)
+            self._llm_client = OpenRouterClient()
 
         return self
 
@@ -457,10 +457,12 @@ class AgentRuntime:
     async def _llm_call(self, messages: list, request_kwargs: dict):
         """LLM call with retry on transient errors (4 attempts, exponential backoff)."""
         max_attempts = 4
+        api_key = await self._config.get_api_key(self._config.provider)
         for attempt in range(max_attempts):
             try:
                 return await self._llm_client.complete(
                     messages=messages,
+                    api_key=api_key,
                     **request_kwargs,
                 )
             except Exception as e:
@@ -469,6 +471,8 @@ class AgentRuntime:
                 wait = min(2 ** attempt, 10)
                 logger.warning("LLM call failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_attempts, wait, e)
                 await asyncio.sleep(wait)
+                # Re-resolve key on retry (may have been refreshed)
+                api_key = await self._config.get_api_key(self._config.provider)
 
     async def _run_turn(self, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main", on_event=None) -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop).

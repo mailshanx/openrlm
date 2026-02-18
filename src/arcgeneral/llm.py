@@ -6,8 +6,9 @@ AgentRuntime only depends on these types — never on provider SDK types directl
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Awaitable, Callable, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,22 +49,62 @@ class CompletionResponse:
 
 
 class LLMClient(Protocol):
-    async def complete(self, messages: list[dict], **kwargs) -> CompletionResponse: ...
+    async def complete(self, messages: list[dict], *, api_key: str, **kwargs) -> CompletionResponse: ...
     async def close(self) -> None: ...
 
 
-class OpenRouterClient:
-    """LLMClient backed by the OpenRouter SDK."""
+# ---------------------------------------------------------------------------
+# Provider → environment variable mapping
+# ---------------------------------------------------------------------------
 
-    def __init__(self, api_key: str):
+PROVIDER_ENV_VARS: dict[str, str] = {
+    "anthropic":    "ANTHROPIC_API_KEY",
+    "openai":       "OPENAI_API_KEY",
+    "google":       "GEMINI_API_KEY",
+    "openrouter":   "OPENROUTER_API_KEY",
+    "groq":         "GROQ_API_KEY",
+    "xai":          "XAI_API_KEY",
+    "mistral":      "MISTRAL_API_KEY",
+}
+
+
+def default_api_key_resolver(provider: str) -> Callable[[str], Awaitable[str]]:
+    """Build a resolver that reads API keys from environment variables.
+
+    Returns an async callable: (provider) -> api_key.
+    The provider argument is used to look up the correct env var.
+    """
+    async def resolve(provider: str) -> str:
+        env_var = PROVIDER_ENV_VARS.get(provider)
+        if env_var is None:
+            # Unknown provider — try PROVIDER_API_KEY convention
+            env_var = f"{provider.upper().replace('-', '_')}_API_KEY"
+        key = os.environ.get(env_var, "")
+        if not key:
+            raise ValueError(
+                f"No API key for provider {provider!r}. "
+                f"Set the {env_var} environment variable."
+            )
+        return key
+    return resolve
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter client
+# ---------------------------------------------------------------------------
+
+class OpenRouterClient:
+    """LLMClient backed by the OpenRouter SDK. Stateless w.r.t. auth — key is passed per-call."""
+
+    def __init__(self):
         import httpx
+        self._http_client = httpx.AsyncClient(http2=True, follow_redirects=True)
+
+    async def complete(self, messages: list[dict], *, api_key: str, **kwargs) -> CompletionResponse:
         from openrouter import OpenRouter
 
-        self._http_client = httpx.AsyncClient(http2=True, follow_redirects=True)
-        self._sdk = OpenRouter(api_key=api_key, async_client=self._http_client)
-
-    async def complete(self, messages: list[dict], **kwargs) -> CompletionResponse:
-        raw = await self._sdk.chat.send_async(messages=messages, **kwargs)
+        sdk = OpenRouter(api_key=api_key, async_client=self._http_client)
+        raw = await sdk.chat.send_async(messages=messages, **kwargs)
         choice = raw.choices[0]
         msg = choice.message
 

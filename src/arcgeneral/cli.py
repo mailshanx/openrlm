@@ -3,6 +3,7 @@ import asyncio
 import importlib
 import logging
 import signal
+import textwrap
 import time
 from pathlib import Path
 from dotenv import load_dotenv
@@ -29,17 +30,46 @@ def _load_functions(registry: HostFunctionRegistry, dotted_paths: list[str]) -> 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LLM agent with stateful IPython REPL")
-    parser.add_argument("message", type=str, nargs="?", default=None, help="User message (omit for interactive session)")
-    parser.add_argument("--model", type=str, default="z-ai/glm-5", help="Model name")
-    parser.add_argument("--api-key-env-var", type=str, default="OPENROUTER_API_KEY", help="Env var name for API key")
-    parser.add_argument("--image", type=str, default=None, help="Docker image tag for sandbox (omit for local mode)")
-    parser.add_argument("--timeout", type=float, default=3600.0, help="Code execution timeout in seconds")
-    parser.add_argument("--max-rounds", type=int, default=50, help="Max tool loop iterations")
-    parser.add_argument("--env-file", type=str, default=".env", help="Path to .env file")
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
-    parser.add_argument("--workspace", type=str, default=None, help="Working directory shared with agents (default: cwd)")
-    parser.add_argument("--log-file", type=str, default=str(Path.home() / "Downloads" / "arcgeneral.log"), help="Log file path")
+    parser = argparse.ArgumentParser(
+        description="LLM agent with stateful IPython REPL",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              arcgeneral "summarize this repo"
+              arcgeneral --provider anthropic --model claude-sonnet-4-5 "explain main.py"
+              arcgeneral --functions mytools "use my_search to find X"
+              arcgeneral  # interactive session
+
+            environment:
+              API keys are read from provider-specific environment variables:
+                openrouter   → OPENROUTER_API_KEY (default)
+                anthropic    → ANTHROPIC_API_KEY
+                openai       → OPENAI_API_KEY
+                google       → GEMINI_API_KEY
+              A .env file in the current directory is loaded automatically.
+        """),
+    )
+    parser.add_argument("message", type=str, nargs="?", default=None,
+                        help="User message (omit for interactive session)")
+    parser.add_argument("--model", type=str, default="z-ai/glm-5",
+                        help="Model identifier (default: %(default)s)")
+    parser.add_argument("--provider", type=str, default="openrouter",
+                        help="LLM provider — determines API key and endpoint (default: %(default)s)")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Docker image tag for sandbox (omit for local mode)")
+    parser.add_argument("--timeout", type=float, default=3600.0,
+                        help="Code execution timeout in seconds (default: %(default)s)")
+    parser.add_argument("--max-rounds", type=int, default=50,
+                        help="Max tool loop iterations (default: %(default)s)")
+    parser.add_argument("--env-file", type=str, default=".env",
+                        help="Path to .env file (default: %(default)s)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable debug logging")
+    parser.add_argument("--workspace", type=str, default=None,
+                        help="Working directory shared with agents (default: cwd)")
+    parser.add_argument("--log-file", type=str,
+                        default=str(Path.home() / "Downloads" / "arcgeneral.log"),
+                        help="Log file path (default: %(default)s)")
     parser.add_argument("--functions", type=str, default=None,
                         metavar="MODULES",
                         help="Comma-separated Python modules with register(registry) to load custom functions")
@@ -72,7 +102,7 @@ def main():
 
     config = AgentConfig(
         model=args.model,
-        api_key_env_var=args.api_key_env_var,
+        provider=args.provider,
         sandbox_image=args.image,  # None = local mode
         code_timeout=args.timeout,
         max_tool_rounds=args.max_rounds,
