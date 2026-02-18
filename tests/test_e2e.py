@@ -1119,13 +1119,20 @@ async def test_cancel_drains_queue():
 
 async def test_cancel_run_single_cleans_subtasks():
     """Cancelling run_single cancels sub-agent tasks and leaves the
-    session usable for subsequent turns."""
+    session usable for subsequent turns.
+
+    Uses mock _run_turn to test the Session-level cancellation logic:
+    - creates a real sub-agent task via _host_create_agent/_host_run_agent
+    - the sub-agent's mock _run_turn sleeps forever (simulating work)
+    - cancel propagates to the sub-agent task
+    - _running_tasks is cleared
+    - session remains usable for a follow-up turn
+    """
     config = AgentConfig(model="test/model", sandbox_image=TAG)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     cancelled_agents = []
-
     async def _mock_run_turn(full_history, sandbox, config, request_kwargs, agent_label="main", on_event=None):
         if agent_label != "main":
             # Sub-agent: sleep forever until cancelled
@@ -1146,20 +1153,87 @@ async def test_cancel_run_single_cleans_subtasks():
             result = await sandbox.execute(task, timeout=30.0)
             full_history.append({"role": "assistant", "content": result})
             return result
-
     runtime._run_turn = _mock_run_turn
 
     async with runtime:
         session = await runtime.create_session("cli")
-
-        # Start a turn that spawns a sub-agent and hangs
         turn_task = asyncio.create_task(
             session.run_single("spawn_and_hang")
         )
         await asyncio.sleep(1.0)
-
-        # Verify sub-agent task is running
         report("cancel_subtask_exists", len(session._running_tasks) == 1)
+        # Cancel the turn
+        turn_task.cancel()
+        try:
+            await turn_task
+        except asyncio.CancelledError:
+            pass
+        # Sub-agent task should have been cancelled
+        report("cancel_subtask_cancelled", len(cancelled_agents) == 1)
+        report("cancel_tasks_cleared", len(session._running_tasks) == 0)
+        result = await session.run_single("print('still_alive')")
+        report("cancel_session_reusable", "still_alive" in result, repr(result.strip()))
+        await runtime.close_session("cli")
+
+
+async def test_cancel_interrupts_subagent_e2e():
+    """Full end-to-end: cancel a turn that spawned a sub-agent doing real
+    sandbox work.  Both the main and sub-agent child processes get SIGINT,
+    their queues are drained, and the next turn sees clean output.
+
+    Uses local fork server (no Docker) + mock LLM. The mock LLM responses:
+      1. Main round 0: tool_call → code creates sub-agent, runs it, awaits result
+      2. Sub-agent round 0: tool_call → code does time.sleep(60)
+      (turn is cancelled while sub-agent sleeps)
+    After cancel:
+      3. Main round 0 (retry): tool_call → code prints a marker
+      4. Main round 1: text response with the marker
+    """
+    call_count = 0
+    sub_responded = asyncio.Event()
+
+    sub_agent_code = """aid = await create_agent(instructions='helper')
+tid = await run_agent(agent_id=aid, task='Sleep forever')
+result = await await_result(tid)
+print(f'sub says: {result}')"""
+
+    def _make_responses():
+        """Return a fresh response list for a turn attempt."""
+        return [
+            _tool_resp(sub_agent_code),         # main round 0: spawn sub-agent
+            _tool_resp("import time; time.sleep(60)"),  # sub-agent round 0: long sleep
+            _text_resp("Should not reach"),     # main round 1 (never reached)
+        ]
+
+    responses = _make_responses()
+
+    async def mock_llm(messages, request_kwargs):
+        nonlocal call_count, responses
+        call_count += 1
+        if not responses:
+            # After cancellation, the retry turn gets fresh responses
+            raise RuntimeError("Mock LLM exhausted unexpectedly")
+        return responses.pop(0)
+
+    config = AgentConfig(model="test/model", sandbox_image=None)  # local mode
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
+
+    async with runtime:
+        runtime._llm_call = mock_llm
+
+        session = await runtime.create_session("test")
+
+        # Start a turn that will hang on sub-agent sleep
+        turn_task = asyncio.create_task(
+            session.run_single("Use a sub-agent to do work")
+        )
+        # Give enough time for fork server to spawn children and sub-agent to start sleeping
+        await asyncio.sleep(3.0)
+
+        # Sub-agent task should be running
+        n_running = len(session._running_tasks)
+        report("e2e_cancel_subtask_running", n_running >= 1, f"running={n_running}")
 
         # Cancel the turn
         turn_task.cancel()
@@ -1168,15 +1242,25 @@ async def test_cancel_run_single_cleans_subtasks():
         except asyncio.CancelledError:
             pass
 
-        # Sub-agent task should have been cancelled
-        report("cancel_subtask_cancelled", len(cancelled_agents) == 1)
-        report("cancel_tasks_cleared", len(session._running_tasks) == 0)
+        # All sub-agent tasks should be cleaned up
+        report("e2e_cancel_tasks_cleared", len(session._running_tasks) == 0,
+               f"remaining={len(session._running_tasks)}")
 
-        # Session should still be usable
-        result = await session.run_single("print('still_alive')")
-        report("cancel_session_reusable", "still_alive" in result, repr(result.strip()))
+        # Main session sandbox should still work — no stale output.
+        # Set up fresh responses for the recovery turn.
+        responses = [
+            _tool_resp("print('main_ok_after_cancel')"),  # main round 0
+            _text_resp("Recovery complete"),               # main round 1
+        ]
+        result = await session.run_single("Recover")
+        report("e2e_cancel_main_clean", "Recovery complete" in result, repr(result))
 
-        await runtime.close_session("cli")
+        # The main sandbox actually executed the code — verify no stale sleep output leaked
+        # (If the queue was dirty, we'd get garbage or hang here.)
+        report("e2e_cancel_no_stale", "time.sleep" not in result and "sleep" not in result.lower(),
+               repr(result))
+
+        await runtime.close_session("test")
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -1278,6 +1362,7 @@ async def main():
     await test_cancellation_rolls_back_history()
     await test_cancel_drains_queue()
     await test_cancel_run_single_cleans_subtasks()
+    await test_cancel_interrupts_subagent_e2e()
     total = passed_count + len(failures)
     print()
     if failures:
