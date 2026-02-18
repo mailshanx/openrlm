@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import importlib
 import importlib.util
+import json
 import logging
 import signal
 import textwrap
@@ -83,6 +84,8 @@ def parse_args() -> argparse.Namespace:
               arcgeneral --provider anthropic --model claude-sonnet-4-5 "explain main.py"
               arcgeneral --functions ./my-tools "use my_search to find X"
               arcgeneral --functions ./contrib "search for X"
+              arcgeneral --context history.json "continue the analysis"
+              arcgeneral --json "compute pi" | jq .result
               arcgeneral  # interactive session
 
             environment:
@@ -119,6 +122,12 @@ def parse_args() -> argparse.Namespace:
                         metavar="PATH",
                         help="Directory, .py file, or dotted module name to load custom functions from "
                              "(comma-separated for multiple)")
+    parser.add_argument("--context", type=str, default=None,
+                        metavar="FILE",
+                        help="JSON file with conversation history to prepend "
+                             '(array of {"role": "user"|"assistant", "content": "..."})')
+    parser.add_argument("--json", action="store_true",
+                        help="Output result as JSON object")
     return parser.parse_args()
 
 
@@ -146,6 +155,26 @@ def main():
         modules = [m.strip() for m in args.functions.split(",") if m.strip()]
         _load_functions(registry, modules)
 
+    # Load conversation context if provided
+    context_messages: list[dict] | None = None
+    if args.context:
+        context_path = Path(args.context).expanduser()
+        if not context_path.is_file():
+            raise SystemExit(f"Error: context file not found: {args.context}")
+        try:
+            raw = json.loads(context_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            raise SystemExit(f"Error: could not read context file: {e}") from e
+        if not isinstance(raw, list):
+            raise SystemExit("Error: context file must contain a JSON array of messages")
+        valid_roles = {"user", "assistant"}
+        for i, msg in enumerate(raw):
+            if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+                raise SystemExit(f"Error: context message {i} must have 'role' and 'content' fields")
+            if msg["role"] not in valid_roles:
+                raise SystemExit(f"Error: context message {i} has invalid role {msg['role']!r} (expected user or assistant)")
+        context_messages = raw
+
     config = AgentConfig(
         model=args.model,
         provider=args.provider,
@@ -158,22 +187,31 @@ def main():
     # create_agent/run_agent are registered by AgentRuntime.__init__
     runtime = AgentRuntime(config, registry)
 
+    if args.message is None and args.json:
+        raise SystemExit("Error: --json requires a message argument (not interactive mode)")
     if args.message is not None:
         async def _run():
             if args.image:
                 await cleanup_orphaned_containers()
             async with runtime:
-                session = await runtime.create_session("cli")
+                session = await runtime.create_session("cli", context_messages=context_messages)
                 result = await session.run_single(args.message)
                 await runtime.close_session("cli")
                 return result
-        print(asyncio.run(_run()))
+        if args.json:
+            try:
+                result = asyncio.run(_run())
+                print(json.dumps({"result": result, "error": None}))
+            except Exception as e:
+                print(json.dumps({"result": None, "error": str(e)}))
+        else:
+            print(asyncio.run(_run()))
     else:
         async def _session():
             if args.image:
                 await cleanup_orphaned_containers()
             async with runtime:
-                session = await runtime.create_session("cli")
+                session = await runtime.create_session("cli", context_messages=context_messages)
                 loop = asyncio.get_event_loop()
                 shutdown = asyncio.Event()
                 turn_task: asyncio.Task | None = None

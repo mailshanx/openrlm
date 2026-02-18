@@ -285,6 +285,78 @@ async def test_cli_functions_flag():
         except SystemExit:
             report("cli_load_functions_empty_dir", True)
 
+async def test_cli_context_and_json_flags():
+    """--context and --json flags parse correctly; context file is validated."""
+    import tempfile
+    from arcgeneral.cli import parse_args
+
+    original_argv = sys.argv
+
+    # --context and --json parse correctly
+    try:
+        sys.argv = ["arcgeneral", "hello", "--context", "/tmp/ctx.json", "--json"]
+        args = parse_args()
+        report("cli_context_parsed", args.context == "/tmp/ctx.json")
+        report("cli_json_parsed", args.json is True)
+    finally:
+        sys.argv = original_argv
+
+    # Defaults: no context, no json
+    try:
+        sys.argv = ["arcgeneral", "hello"]
+        args = parse_args()
+        report("cli_context_default_none", args.context is None)
+        report("cli_json_default_false", args.json is False)
+    finally:
+        sys.argv = original_argv
+
+    # Context file validation: valid file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ], f)
+        valid_ctx_path = f.name
+    ctx_data = json.loads(Path(valid_ctx_path).read_text())
+    report("cli_context_valid_file", len(ctx_data) == 2 and ctx_data[0]["role"] == "user")
+    Path(valid_ctx_path).unlink()
+
+    # Context file validation: invalid role
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump([{"role": "system", "content": "bad"}], f)
+        bad_role_path = f.name
+    # The validation happens in main(), not parse_args(), so we test the validation logic directly
+    from arcgeneral.cli import main as _cli_main
+    try:
+        sys.argv = ["arcgeneral", "hello", "--context", bad_role_path]
+        _cli_main()
+        report("cli_context_invalid_role_fails", False, "should have raised")
+    except SystemExit as e:
+        report("cli_context_invalid_role_fails", "invalid role" in str(e))
+    finally:
+        sys.argv = original_argv
+        Path(bad_role_path).unlink()
+
+    # Context file validation: missing file
+    try:
+        sys.argv = ["arcgeneral", "hello", "--context", "/nonexistent/ctx.json"]
+        _cli_main()
+        report("cli_context_missing_file_fails", False, "should have raised")
+    except SystemExit as e:
+        report("cli_context_missing_file_fails", "not found" in str(e))
+    finally:
+        sys.argv = original_argv
+
+    # --json without message should fail
+    try:
+        sys.argv = ["arcgeneral", "--json"]
+        _cli_main()
+        report("cli_json_requires_message", False, "should have raised")
+    except SystemExit as e:
+        report("cli_json_requires_message", True)
+    finally:
+        sys.argv = original_argv
+
 
 # ---------------------------------------------------------------------------
 # Tool dispatch (requires sandbox)
@@ -1394,6 +1466,7 @@ async def main():
     await test_cli_parse_defaults()
     await test_cli_parse_overrides()
     await test_cli_functions_flag()
+    await test_cli_context_and_json_flags()
 
     print("\nSandbox tests (starting fork server...):")
     async with ForkServer(tag=TAG) as fs:

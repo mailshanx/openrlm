@@ -333,13 +333,22 @@ class AgentRuntime:
 
     # ── Session management ──
 
-    async def create_session(self, session_id: str, *, on_event=None) -> Session:
-        """Create a new independent session with its own sandbox and message history."""
+    async def create_session(self, session_id: str, *, on_event=None, context_messages: list[dict] | None = None) -> Session:
+        """Create a new independent session with its own sandbox and message history.
+
+        Args:
+            session_id: Caller-provided unique identifier for this session.
+            on_event: Optional callback for session events.
+            context_messages: Optional list of {"role": "user"|"assistant", "content": "..."}
+                messages to prepend as conversation history after the system prompt.
+        """
         if session_id in self._sessions:
             raise ValueError(f"Session {session_id!r} already exists")
         sandbox = await self._fork_server.create_sandbox()
         await self._inject_agent_id(sandbox, session_id)
         messages, request_kwargs = self._init_messages(self._config)
+        if context_messages:
+            messages.extend(context_messages)
         session = Session(
             runtime=self,
             sandbox=sandbox,
