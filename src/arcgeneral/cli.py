@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import importlib
+import importlib.util
 import logging
 import signal
 import textwrap
@@ -13,20 +14,63 @@ from arcgeneral.sandbox import cleanup_orphaned_containers
 from arcgeneral.agent import AgentRuntime
 
 
-def _load_functions(registry: HostFunctionRegistry, dotted_paths: list[str]) -> None:
-    """Import each dotted path and call its register(registry) function."""
-    for path in dotted_paths:
-        try:
-            module = importlib.import_module(path)
-        except ImportError as e:
-            raise SystemExit(f"Error: could not import function module {path!r}: {e}") from e
-        register_fn = getattr(module, "register", None)
-        if register_fn is None:
-            raise SystemExit(
-                f"Error: module {path!r} has no register() function. "
-                f"Expected: def register(registry: HostFunctionRegistry) -> None"
-            )
-        register_fn(registry)
+def _load_module_from_file(filepath: Path) -> object:
+    """Load a Python module from a file path."""
+    spec = importlib.util.spec_from_file_location(filepath.stem, filepath)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Error: could not load {filepath}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _register_module(registry: HostFunctionRegistry, module: object, source: str) -> None:
+    """Call register(registry) on a loaded module, or raise SystemExit."""
+    register_fn = getattr(module, "register", None)
+    if register_fn is None:
+        raise SystemExit(
+            f"Error: {source} has no register() function. "
+            f"Expected: def register(registry: HostFunctionRegistry) -> None"
+        )
+    register_fn(registry)
+
+
+def _load_functions(registry: HostFunctionRegistry, specs: list[str]) -> None:
+    """Load custom functions from file paths, directories, or dotted module names.
+
+    Each spec is one of:
+      - A directory path  → load all .py files in it that have register()
+      - A .py file path   → load that file
+      - A dotted name     → importlib.import_module()
+    """
+    for spec in specs:
+        p = Path(spec).expanduser()
+        if p.is_dir():
+            py_files = sorted(p.glob("*.py"))
+            if not py_files:
+                raise SystemExit(f"Error: no .py files found in {p}")
+            for f in py_files:
+                if f.name.startswith("_"):
+                    continue
+                module = _load_module_from_file(f)
+                if hasattr(module, "register"):
+                    _register_module(registry, module, str(f))
+        elif p.is_file() or spec.endswith(".py"):
+            if not p.is_file():
+                raise SystemExit(f"Error: file not found: {spec}")
+            module = _load_module_from_file(p)
+            _register_module(registry, module, spec)
+        else:
+            # Dotted module name — standard import
+            try:
+                module = importlib.import_module(spec)
+            except ImportError as e:
+                raise SystemExit(
+                    f"Error: could not import function module {spec!r}: {e}\n"
+                    f"Hint: if installed via 'uv tool', re-install with: "
+                    f"uv tool install arcgeneral --with <package>"
+                ) from e
+            _register_module(registry, module, spec)
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +81,8 @@ def parse_args() -> argparse.Namespace:
             examples:
               arcgeneral "summarize this repo"
               arcgeneral --provider anthropic --model claude-sonnet-4-5 "explain main.py"
-              arcgeneral --functions mytools "use my_search to find X"
+              arcgeneral --functions ./my-tools "use my_search to find X"
+              arcgeneral --functions ./contrib "search for X"
               arcgeneral  # interactive session
 
             environment:
@@ -71,8 +116,9 @@ def parse_args() -> argparse.Namespace:
                         default=str(Path.home() / "Downloads" / "arcgeneral.log"),
                         help="Log file path (default: %(default)s)")
     parser.add_argument("--functions", type=str, default=None,
-                        metavar="MODULES",
-                        help="Comma-separated Python modules with register(registry) to load custom functions")
+                        metavar="PATH",
+                        help="Directory, .py file, or dotted module name to load custom functions from "
+                             "(comma-separated for multiple)")
     return parser.parse_args()
 
 

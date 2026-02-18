@@ -13,6 +13,7 @@ import asyncio
 import json
 import sys
 import os
+from pathlib import Path
 from dataclasses import dataclass
 
 from arcgeneral.agent import DEFAULT_SYSTEM_PROMPT
@@ -231,6 +232,58 @@ async def test_cli_functions_flag():
         report("cli_load_functions_no_register_fails", True)
     finally:
         del sys.modules["_test_bare_module"]
+
+    # Test _load_functions with a .py file path
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        func_file = Path(tmpdir) / "my_funcs.py"
+        func_file.write_text(
+            "def register(registry):\n"
+            "    registry._test_file_loaded = True\n"
+        )
+        registry = HostFunctionRegistry()
+        _load_functions(registry, [str(func_file)])
+        report("cli_load_functions_file", getattr(registry, "_test_file_loaded", False))
+
+    # Test _load_functions with a directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "tool_a.py").write_text(
+            "def register(registry):\n"
+            "    if not hasattr(registry, '_dir_loaded'): registry._dir_loaded = []\n"
+            "    registry._dir_loaded.append('a')\n"
+        )
+        (Path(tmpdir) / "tool_b.py").write_text(
+            "def register(registry):\n"
+            "    if not hasattr(registry, '_dir_loaded'): registry._dir_loaded = []\n"
+            "    registry._dir_loaded.append('b')\n"
+        )
+        # _underscore files should be skipped
+        (Path(tmpdir) / "_private.py").write_text(
+            "def register(registry):\n"
+            "    registry._should_not_load = True\n"
+        )
+        # Files without register() should be silently skipped in directory mode
+        (Path(tmpdir) / "no_register.py").write_text("x = 1\n")
+        registry = HostFunctionRegistry()
+        _load_functions(registry, [tmpdir])
+        loaded = sorted(getattr(registry, "_dir_loaded", []))
+        report("cli_load_functions_dir", loaded == ["a", "b"], repr(loaded))
+        report("cli_load_functions_dir_skips_underscore", not getattr(registry, "_should_not_load", False))
+
+    # Test _load_functions with missing file
+    try:
+        _load_functions(HostFunctionRegistry(), ["/nonexistent/path/funcs.py"])
+        report("cli_load_functions_missing_file", False, "should have raised")
+    except SystemExit:
+        report("cli_load_functions_missing_file", True)
+
+    # Test _load_functions with empty directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            _load_functions(HostFunctionRegistry(), [tmpdir])
+            report("cli_load_functions_empty_dir", False, "should have raised")
+        except SystemExit:
+            report("cli_load_functions_empty_dir", True)
 
 
 # ---------------------------------------------------------------------------
