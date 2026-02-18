@@ -279,7 +279,7 @@ class AgentRuntime:
 
         # Init API key resolver (default reads from env vars)
         if self._config.get_api_key is None:
-            self._config.get_api_key = default_api_key_resolver(self._config.provider)
+            self._config.get_api_key = default_api_key_resolver()
         # Init LLM client (create default if none injected)
         if self._llm_client is None:
             self._llm_client = OpenRouterClient()

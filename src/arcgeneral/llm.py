@@ -68,7 +68,7 @@ PROVIDER_ENV_VARS: dict[str, str] = {
 }
 
 
-def default_api_key_resolver(provider: str) -> Callable[[str], Awaitable[str]]:
+def default_api_key_resolver() -> Callable[[str], Awaitable[str]]:
     """Build a resolver that reads API keys from environment variables.
 
     Returns an async callable: (provider) -> api_key.
