@@ -145,17 +145,36 @@ class Session:
         """The caller-provided session ID."""
         return self._session_id
     async def run_single(self, user_message: str) -> str:
-        """Run the agent loop for a single message. Returns the final text response."""
+        """Run the agent loop for a single message. Returns the final text response.
+
+        On CancelledError, cancels all sub-agent tasks spawned during this
+        turn so the entire agent tree is interrupted, then re-raises.
+        """
         async with self._lock:
             logger.info("[user] %s", user_message)
             self._messages.append({"role": "user", "content": user_message})
-            result = await self._runtime._run_turn(
-                self._messages, self._sandbox, self._runtime._config,
-                self._request_kwargs, agent_label="main",
-                on_event=self._on_event,
-            )
-            logger.info("[assistant] %s", result)
-            return result
+            try:
+                result = await self._runtime._run_turn(
+                    self._messages, self._sandbox, self._runtime._config,
+                    self._request_kwargs, agent_label="main",
+                    on_event=self._on_event,
+                )
+                logger.info("[assistant] %s", result)
+                return result
+            except asyncio.CancelledError:
+                # Cancel all sub-agent tasks spawned during this turn
+                n_tasks = len(self._running_tasks)
+                for task_id, t in list(self._running_tasks.items()):
+                    t.cancel()
+                if self._running_tasks:
+                    await asyncio.gather(
+                        *self._running_tasks.values(),
+                        return_exceptions=True,
+                    )
+                self._running_tasks.clear()
+                logger.info("[session %s] Turn cancelled, %d sub-agent tasks cleaned up",
+                            self._session_id, n_tasks)
+                raise
 
     async def close(self):
         """Close this session: cancel tasks, destroy sandboxes, unregister from runtime."""

@@ -198,14 +198,12 @@ class ForkServerClient:
             raise RuntimeError(f"Unexpected destroy response: {resp}")
 
     async def execute(self, agent_id: str, code: str, timeout: float = 120) -> ExecutionResult:
-        """Execute code in the specified agent. Interrupts on timeout."""
+        """Execute code in the specified agent. Interrupts on timeout or cancellation."""
         if self._writer is None:
             raise ConnectionError("Not connected to fork server")
-
         queue = self._queues.get(agent_id)
         if queue is None:
             raise RuntimeError(f"No queue for agent {agent_id!r} — was it spawned?")
-
         await self._send({"type": "execute", "agent_id": agent_id, "code": code})
 
         chunks: list[str] = []
@@ -223,18 +221,25 @@ class ForkServerClient:
                             raise ExecutionError(short, trace)
                         text = "".join(chunks).strip() if chunks else None
                         return ExecutionResult(text=text)
-        except asyncio.TimeoutError:
-            await self._interrupt(agent_id)
-            # Drain remaining messages until result
-            try:
-                async with asyncio.timeout(3.0):
-                    while True:
-                        msg = await self._queue_get(queue)
-                        if msg["type"] == "result":
-                            break
-            except (asyncio.TimeoutError, ConnectionError):
-                pass
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await self._interrupt_and_drain(agent_id, queue)
             raise
+
+    async def _interrupt_and_drain(self, agent_id: str, queue: asyncio.Queue) -> None:
+        """Interrupt a running execution and drain messages until the result arrives.
+
+        Called on both timeout and cancellation to leave the queue clean
+        so the next execute call on this agent won't read stale messages.
+        """
+        await self._interrupt(agent_id)
+        try:
+            async with asyncio.timeout(3.0):
+                while True:
+                    msg = await self._queue_get(queue)
+                    if msg["type"] == "result":
+                        break
+        except (asyncio.TimeoutError, ConnectionError):
+            pass
 
     async def _interrupt(self, agent_id: str):
         """Send interrupt via the control channel (ephemeral connection)."""

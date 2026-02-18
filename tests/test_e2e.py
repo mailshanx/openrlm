@@ -1088,6 +1088,95 @@ async def test_local_forkserver_timeout(sb):
 async def test_local_forkserver_post_timeout_recovery(sb):
     r = await sb.execute("print('recovered')", timeout=10)
     report("local_post_timeout_recovery", r.strip() == "recovered", repr(r.strip()))
+
+
+async def test_cancel_drains_queue():
+    """After cancelling client.execute, the queue is clean — the next
+    execute call on the same agent gets a fresh result, not a stale one."""
+    async with LocalForkServer() as fs:
+        sb = await fs.create_sandbox()
+
+        # Start a long-running execution
+        task = asyncio.create_task(
+            sb.execute("import time; time.sleep(30)", timeout=60)
+        )
+        # Let it start
+        await asyncio.sleep(0.5)
+
+        # Cancel it
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # The queue should be clean. Next execute should work correctly.
+        r = await sb.execute("print('after_cancel')", timeout=10)
+        report("cancel_drain_clean", r.strip() == "after_cancel", repr(r.strip()))
+
+        await sb.close()
+
+
+async def test_cancel_run_single_cleans_subtasks():
+    """Cancelling run_single cancels sub-agent tasks and leaves the
+    session usable for subsequent turns."""
+    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
+
+    cancelled_agents = []
+
+    async def _mock_run_turn(full_history, sandbox, config, request_kwargs, agent_label="main", on_event=None):
+        if agent_label != "main":
+            # Sub-agent: sleep forever until cancelled
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled_agents.append(agent_label)
+                raise
+        # Main agent: create a sub-agent, start a task, then sleep forever
+        task = full_history[-1]["content"]
+        if task == "spawn_and_hang":
+            # Simulate: create_agent + run_agent via direct runtime calls
+            aid = await runtime._host_create_agent("worker", _caller_id="cli")
+            await runtime._host_run_agent(aid, "do work")
+            # Now hang as if awaiting result
+            await asyncio.sleep(3600)
+        else:
+            result = await sandbox.execute(task, timeout=30.0)
+            full_history.append({"role": "assistant", "content": result})
+            return result
+
+    runtime._run_turn = _mock_run_turn
+
+    async with runtime:
+        session = await runtime.create_session("cli")
+
+        # Start a turn that spawns a sub-agent and hangs
+        turn_task = asyncio.create_task(
+            session.run_single("spawn_and_hang")
+        )
+        await asyncio.sleep(1.0)
+
+        # Verify sub-agent task is running
+        report("cancel_subtask_exists", len(session._running_tasks) == 1)
+
+        # Cancel the turn
+        turn_task.cancel()
+        try:
+            await turn_task
+        except asyncio.CancelledError:
+            pass
+
+        # Sub-agent task should have been cancelled
+        report("cancel_subtask_cancelled", len(cancelled_agents) == 1)
+        report("cancel_tasks_cleared", len(session._running_tasks) == 0)
+
+        # Session should still be usable
+        result = await session.run_single("print('still_alive')")
+        report("cancel_session_reusable", "still_alive" in result, repr(result.strip()))
+
+        await runtime.close_session("cli")
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -1187,6 +1276,8 @@ async def main():
     await test_sigterm_clean_shutdown()
     await test_sigterm_cancels_inflight_subtasks()
     await test_cancellation_rolls_back_history()
+    await test_cancel_drains_queue()
+    await test_cancel_run_single_cleans_subtasks()
     total = passed_count + len(failures)
     print()
     if failures:

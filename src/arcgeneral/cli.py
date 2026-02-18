@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import signal
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from arcgeneral.config import AgentConfig
@@ -77,10 +78,24 @@ def main():
                 session = await runtime.create_session("cli")
                 loop = asyncio.get_event_loop()
                 shutdown = asyncio.Event()
+                turn_task: asyncio.Task | None = None
+                last_interrupt = 0.0
 
+                def _on_signal():
+                    nonlocal last_interrupt
+                    now = time.monotonic()
+                    if turn_task is not None and not turn_task.done():
+                        # Turn is running — cancel it
+                        turn_task.cancel()
+                        if now - last_interrupt < 1.0:
+                            # Double Ctrl-C while turn running — exit
+                            shutdown.set()
+                        last_interrupt = now
+                    else:
+                        # No turn running — exit
+                        shutdown.set()
                 for sig in (signal.SIGTERM, signal.SIGINT):
-                    loop.add_signal_handler(sig, shutdown.set)
-
+                    loop.add_signal_handler(sig, _on_signal)
                 mode = "docker" if args.image else "local"
                 print(f"arcgeneral session started ({mode} mode). Type 'quit' or 'exit' to end.\n")
                 while not shutdown.is_set():
@@ -93,9 +108,15 @@ def main():
                         break
                     if not stripped:
                         continue
-                    result = await session.run_single(stripped)
-                    print(result)
-                    print()
+                    turn_task = asyncio.create_task(session.run_single(stripped))
+                    try:
+                        result = await turn_task
+                        print(result)
+                        print()
+                    except asyncio.CancelledError:
+                        print("\n(interrupted)")
+                    finally:
+                        turn_task = None
                 await runtime.close_session("cli")
         asyncio.run(_session())
 
