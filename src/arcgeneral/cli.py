@@ -76,7 +76,22 @@ def _load_functions(registry: HostFunctionRegistry, specs: list[str]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="LLM agent with stateful IPython REPL",
+        description=(
+            "Recursive Language Model (RLM) agent with persistent IPython REPL.\n"
+            "\n"
+            "Each agent gets its own stateful IPython environment and can recursively\n"
+            "spawn sub-agents, each with their own isolated REPL. Sub-agents are forked\n"
+            "processes within a single container (or local process tree), making spawning\n"
+            "fast and cheap -- agents can programmatically create large numbers of them.\n"
+            "\n"
+            "Agents interact with context through symbolic manipulation in the REPL:\n"
+            "reading files, transforming data, running computations, and building on\n"
+            "previous results within the same session. Custom host functions can be\n"
+            "injected for capabilities beyond code execution (web search, APIs, etc.).\n"
+            "\n"
+            "By default, agents run as local processes. Use --image to run inside a\n"
+            "Docker container for isolation."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
@@ -86,14 +101,14 @@ def parse_args() -> argparse.Namespace:
               arcgeneral --functions ./contrib "search for X"
               arcgeneral --context history.json "continue the analysis"
               arcgeneral --json "compute pi" | jq .result
+              arcgeneral --image arcgeneral:sandbox "analyze data"  # Docker mode
               arcgeneral  # interactive session
-
             environment:
               API keys are read from provider-specific environment variables:
-                openrouter   → OPENROUTER_API_KEY (default)
-                anthropic    → ANTHROPIC_API_KEY
-                openai       → OPENAI_API_KEY
-                google       → GEMINI_API_KEY
+                openrouter   -> OPENROUTER_API_KEY (default)
+                anthropic    -> ANTHROPIC_API_KEY
+                openai       -> OPENAI_API_KEY
+                google       -> GEMINI_API_KEY
               A .env file in the current directory is loaded automatically.
         """),
     )
