@@ -133,8 +133,12 @@ dependencies = [
     { name = "aiohttp" },
     { name = "httpx", extra = ["http2"] },
     { name = "openrouter" },
-    { name = "parallel-web" },
     { name = "python-dotenv" },
+]
+
+[package.optional-dependencies]
+contrib = [
+    { name = "parallel-web" },
 ]
 
 [package.metadata]
@@ -143,9 +147,10 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
     { name = "openrouter", specifier = ">=0.6.0" },
-    { name = "parallel-web", specifier = ">=0.3.4" },
+    { name = "parallel-web", marker = "extra == 'contrib'", specifier = ">=0.3.4" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
 ]
+provides-extras = ["contrib"]
 
 [[package]]
 name = "attrs"

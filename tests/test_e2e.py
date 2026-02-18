@@ -178,6 +178,61 @@ async def test_cli_parse_overrides():
         sys.argv = original_argv
 
 
+async def test_cli_functions_flag():
+    """--functions flag parses into a list; _load_functions imports and calls register()."""
+    from arcgeneral.cli import parse_args, _load_functions
+
+    # Test parsing: multiple --functions flags accumulate
+    original_argv = sys.argv
+    try:
+        sys.argv = ["arcgeneral", "hello", "--functions", "mod_a", "--functions", "mod_b"]
+        args = parse_args()
+        report("cli_functions_parsed", args.functions == ["mod_a", "mod_b"], repr(args.functions))
+    finally:
+        sys.argv = original_argv
+
+    # Test parsing: no --functions gives empty list
+    try:
+        sys.argv = ["arcgeneral", "hello"]
+        args = parse_args()
+        report("cli_functions_default_empty", args.functions == [], repr(args.functions))
+    finally:
+        sys.argv = original_argv
+
+    # Test _load_functions with a real inline module
+    import types
+    fake_mod = types.ModuleType("_test_fake_functions")
+    registered_names = []
+    def fake_register(registry):
+        registered_names.append("called")
+    fake_mod.register = fake_register
+    sys.modules["_test_fake_functions"] = fake_mod
+    try:
+        registry = HostFunctionRegistry()
+        _load_functions(registry, ["_test_fake_functions"])
+        report("cli_load_functions_called", registered_names == ["called"])
+    finally:
+        del sys.modules["_test_fake_functions"]
+
+    # Test _load_functions with missing module
+    try:
+        _load_functions(HostFunctionRegistry(), ["nonexistent_module_xyz"])
+        report("cli_load_functions_missing_fails", False, "should have raised")
+    except SystemExit:
+        report("cli_load_functions_missing_fails", True)
+
+    # Test _load_functions with module missing register()
+    bare_mod = types.ModuleType("_test_bare_module")
+    sys.modules["_test_bare_module"] = bare_mod
+    try:
+        _load_functions(HostFunctionRegistry(), ["_test_bare_module"])
+        report("cli_load_functions_no_register_fails", False, "should have raised")
+    except SystemExit:
+        report("cli_load_functions_no_register_fails", True)
+    finally:
+        del sys.modules["_test_bare_module"]
+
+
 # ---------------------------------------------------------------------------
 # Tool dispatch (requires sandbox)
 # ---------------------------------------------------------------------------
@@ -1281,6 +1336,7 @@ async def main():
     print("\nCLI arg parsing tests:")
     await test_cli_parse_defaults()
     await test_cli_parse_overrides()
+    await test_cli_functions_flag()
 
     print("\nSandbox tests (starting fork server...):")
     async with ForkServer(tag=TAG) as fs:

@@ -7,14 +7,15 @@ dependencies = [
     "aiodocker>=0.23.0",
     "openrouter>=0.6.0",
     "python-dotenv>=1.2.1",
-    "parallel-web>=0.3.4",
     "aiohttp>=3.9.0",
     "httpx[http2]>=0.28.1",
-]
+    ]
 
+[project.optional-dependencies]
+contrib = [
+    "parallel-web>=0.3.4",
+]
 [project.scripts]
 arcgeneral = "arcgeneral.cli:main"
-
-[tool.setuptools.packages.find]
 where = ["src/"]
 include = ["arcgeneral*"]

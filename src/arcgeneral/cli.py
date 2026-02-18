@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import importlib
 import logging
 import signal
 import time
@@ -7,9 +8,25 @@ from pathlib import Path
 from dotenv import load_dotenv
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry
-from arcgeneral.contrib import internet_extract, internet_search
 from arcgeneral.sandbox import cleanup_orphaned_containers
 from arcgeneral.agent import AgentRuntime
+
+
+def _load_functions(registry: HostFunctionRegistry, dotted_paths: list[str]) -> None:
+    """Import each dotted path and call its register(registry) function."""
+    for path in dotted_paths:
+        try:
+            module = importlib.import_module(path)
+        except ImportError as e:
+            raise SystemExit(f"Error: could not import function module {path!r}: {e}") from e
+        register_fn = getattr(module, "register", None)
+        if register_fn is None:
+            raise SystemExit(
+                f"Error: module {path!r} has no register() function. "
+                f"Expected: def register(registry: HostFunctionRegistry) -> None"
+            )
+        register_fn(registry)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LLM agent with stateful IPython REPL")
@@ -23,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument("--workspace", type=str, default=None, help="Working directory shared with agents (default: cwd)")
     parser.add_argument("--log-file", type=str, default=str(Path.home() / "Downloads" / "arcgeneral.log"), help="Log file path")
+    parser.add_argument("--functions", type=str, action="append", default=[],
+                        metavar="MODULE",
+                        help="Python module with register(registry) to load custom functions (repeatable)")
     return parser.parse_args()
 
 
@@ -46,8 +66,8 @@ def main():
     load_dotenv(args.env_file)
 
     registry = HostFunctionRegistry()
-    internet_extract.register(registry)
-    internet_search.register(registry)
+    _load_functions(registry, args.functions)
+
     config = AgentConfig(
         model=args.model,
         api_key_env_var=args.api_key_env_var,
