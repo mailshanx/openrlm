@@ -61,12 +61,13 @@ Build up results incrementally rather than repeating work or relying on conversa
 When storing results, retain provenance alongside extracted facts.
 Print only what changed or a brief status, not raw output.
   # first call
-  results = await internet_search(...)
-  findings.extend(extract(results))  # keep sources, not just facts
-  print(f"Found {{len(findings)}} items")
+  data = [row for row in csv.reader(open(f'{workspace_path}/input.csv'))]
+  summary = {{"rows": len(data), "columns": len(data[0])}}
+  print(f"Loaded {{summary['rows']}} rows")
 
   # later call — all state from prior calls is still here
-  print(summary(findings))
+  filtered = [r for r in data if float(r[2]) > threshold]
+  print(f"Filtered to {{len(filtered)}} rows")
 
 For data too large to hold in variables, or that other agents need, write to `{workspace_path}`.
 Read it back in later calls rather than re-doing work.
