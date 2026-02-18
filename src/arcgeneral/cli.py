@@ -40,9 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument("--workspace", type=str, default=None, help="Working directory shared with agents (default: cwd)")
     parser.add_argument("--log-file", type=str, default=str(Path.home() / "Downloads" / "arcgeneral.log"), help="Log file path")
-    parser.add_argument("--functions", type=str, action="append", default=[],
-                        metavar="MODULE",
-                        help="Python module with register(registry) to load custom functions (repeatable)")
+    parser.add_argument("--functions", type=str, default=None,
+                        metavar="MODULES",
+                        help="Comma-separated Python modules with register(registry) to load custom functions")
     return parser.parse_args()
 
 
@@ -66,7 +66,9 @@ def main():
     load_dotenv(args.env_file)
 
     registry = HostFunctionRegistry()
-    _load_functions(registry, args.functions)
+    if args.functions:
+        modules = [m.strip() for m in args.functions.split(",") if m.strip()]
+        _load_functions(registry, modules)
 
     config = AgentConfig(
         model=args.model,

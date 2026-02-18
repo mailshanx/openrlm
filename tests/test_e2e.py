@@ -182,20 +182,20 @@ async def test_cli_functions_flag():
     """--functions flag parses into a list; _load_functions imports and calls register()."""
     from arcgeneral.cli import parse_args, _load_functions
 
-    # Test parsing: multiple --functions flags accumulate
+    # Test parsing: comma-separated modules
     original_argv = sys.argv
     try:
-        sys.argv = ["arcgeneral", "hello", "--functions", "mod_a", "--functions", "mod_b"]
+        sys.argv = ["arcgeneral", "hello", "--functions", "mod_a,mod_b"]
         args = parse_args()
-        report("cli_functions_parsed", args.functions == ["mod_a", "mod_b"], repr(args.functions))
+        report("cli_functions_parsed", args.functions == "mod_a,mod_b", repr(args.functions))
     finally:
         sys.argv = original_argv
 
-    # Test parsing: no --functions gives empty list
+    # Test parsing: no --functions gives None
     try:
         sys.argv = ["arcgeneral", "hello"]
         args = parse_args()
-        report("cli_functions_default_empty", args.functions == [], repr(args.functions))
+        report("cli_functions_default_none", args.functions is None, repr(args.functions))
     finally:
         sys.argv = original_argv
 
