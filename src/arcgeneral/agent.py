@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Self
 
-from arcgeneral.llm import LLMClient, OpenRouterClient, CompletionResponse, default_api_key_resolver
+from arcgeneral.llm import LLMClient, OpenRouterClient, AnthropicClient, CompletionResponse, default_api_key_resolver
 
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
@@ -581,7 +581,10 @@ class AgentRuntime:
             self._config.get_api_key = default_api_key_resolver()
         # Init LLM client (create default if none injected)
         if self._llm_client is None:
-            self._llm_client = OpenRouterClient()
+            if self._config.provider == "anthropic":
+                self._llm_client = AnthropicClient()
+            else:
+                self._llm_client = OpenRouterClient()
 
         # Build the services bundle that Sessions will use
         self._services = RuntimeServices(

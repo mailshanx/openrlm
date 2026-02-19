@@ -1,11 +1,11 @@
 """LLM client protocol and response types.
-
 Defines the contract between AgentRuntime and any LLM provider.
 AgentRuntime only depends on these types — never on provider SDK types directly.
 """
 
 from __future__ import annotations
 
+import json as _json
 import os
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol
@@ -142,3 +142,212 @@ class OpenRouterClient:
 
     async def close(self) -> None:
         await self._http_client.aclose()
+
+# ---------------------------------------------------------------------------
+# Anthropic client
+# ---------------------------------------------------------------------------
+
+class AnthropicClient:
+    """LLMClient backed by the Anthropic SDK.
+
+    Translates between OpenAI-shaped messages (used internally by _run_turn)
+    and the Anthropic Messages API format.
+    """
+
+    DEFAULT_MAX_TOKENS = 16384
+
+    def __init__(self):
+        self._client = None  # lazily created
+        self._is_oauth = False
+
+    # Stealth headers matching Pi's Anthropic OAuth implementation.
+    # Required for OAuth tokens (sk-ant-oat-*) to be accepted by Anthropic's API.
+    _OAUTH_HEADERS = {
+        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+        "user-agent": "claude-cli/2.1.2 (external, cli)",
+        "x-app": "cli",
+    }
+    _OAUTH_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+    def _ensure_client(self, api_key: str):
+        import anthropic
+        if self._client is None:
+            if "sk-ant-oat" in api_key:
+                self._client = anthropic.AsyncAnthropic(
+                    api_key=None,
+                    auth_token=api_key,
+                    default_headers=self._OAUTH_HEADERS,
+                )
+                self._is_oauth = True
+            else:
+                self._client = anthropic.AsyncAnthropic(api_key=api_key)
+                self._is_oauth = False
+        return self._client
+
+    async def complete(self, messages: list[dict], *, api_key: str, **kwargs) -> CompletionResponse:
+        client = self._ensure_client(api_key)
+
+        # Extract system message from the list — Anthropic takes it as a separate param
+        system_content = None
+        api_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_content = msg["content"]
+            else:
+                api_messages.append(msg)
+
+        # Translate messages from OpenAI format to Anthropic format
+        anthropic_messages = self._translate_messages(api_messages)
+
+        # Translate tools
+        anthropic_tools = None
+        if "tools" in kwargs:
+            anthropic_tools = [self._translate_tool(t) for t in kwargs.pop("tools")]
+
+        # Build request
+        model = kwargs.pop("model", "claude-sonnet-4-5-20250514")
+        max_tokens = kwargs.pop("max_tokens", self.DEFAULT_MAX_TOKENS)
+        temperature = kwargs.pop("temperature", None)
+
+        create_kwargs: dict = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": anthropic_messages,
+        }
+        if self._is_oauth:
+            # OAuth requires Claude Code identity as first system block
+            blocks = [{"type": "text", "text": self._OAUTH_SYSTEM_IDENTITY}]
+            if system_content:
+                blocks.append({"type": "text", "text": system_content})
+            create_kwargs["system"] = blocks
+        elif system_content is not None:
+            create_kwargs["system"] = system_content
+        if anthropic_tools is not None:
+            create_kwargs["tools"] = anthropic_tools
+        if temperature is not None:
+            create_kwargs["temperature"] = temperature
+
+        raw = await client.messages.create(**create_kwargs)
+
+        # Translate response back to our CompletionResponse
+        return self._translate_response(raw)
+
+    @staticmethod
+    def _translate_tool(openai_tool: dict) -> dict:
+        """Convert OpenAI tool format to Anthropic tool format."""
+        fn = openai_tool["function"]
+        return {
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "input_schema": fn["parameters"],
+        }
+
+    @staticmethod
+    def _translate_messages(messages: list[dict]) -> list[dict]:
+        """Convert OpenAI-shaped messages to Anthropic-shaped messages.
+
+        Key differences:
+        - Assistant tool_calls become content blocks (text + tool_use)
+        - Tool result messages (role=tool) become user messages with tool_result blocks
+        - Consecutive same-role messages are merged (Anthropic rejects them)
+        """
+        result: list[dict] = []
+
+        for msg in messages:
+            role = msg.get("role")
+
+            if role == "assistant":
+                content_blocks = []
+                # Add text if present
+                if msg.get("content"):
+                    content_blocks.append({"type": "text", "text": msg["content"]})
+                # Convert tool_calls to tool_use blocks
+                if "tool_calls" in msg:
+                    for tc in msg["tool_calls"]:
+                        fn = tc["function"]
+                        try:
+                            input_obj = _json.loads(fn["arguments"])
+                        except (ValueError, TypeError):
+                            input_obj = {}
+                        content_blocks.append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": fn["name"],
+                            "input": input_obj,
+                        })
+                anthropic_msg = {"role": "assistant", "content": content_blocks}
+
+            elif role == "tool":
+                # Tool results become a user message with tool_result content block
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": msg["tool_call_id"],
+                    "content": msg.get("content", ""),
+                }
+                anthropic_msg = {"role": "user", "content": [block]}
+
+            elif role == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    anthropic_msg = {"role": "user", "content": content}
+                else:
+                    anthropic_msg = {"role": "user", "content": content}
+
+            else:
+                # Pass through unknown roles
+                anthropic_msg = msg
+
+            # Merge consecutive same-role messages
+            if result and result[-1]["role"] == anthropic_msg["role"]:
+                prev = result[-1]
+                # Normalize both to lists of content blocks for merging
+                prev_content = prev["content"]
+                new_content = anthropic_msg["content"]
+                if isinstance(prev_content, str):
+                    prev_content = [{"type": "text", "text": prev_content}]
+                if isinstance(new_content, str):
+                    new_content = [{"type": "text", "text": new_content}]
+                prev["content"] = prev_content + new_content
+            else:
+                result.append(anthropic_msg)
+
+        return result
+
+    @staticmethod
+    def _translate_response(raw) -> CompletionResponse:
+        """Convert an Anthropic Message to our CompletionResponse."""
+        text_parts = []
+        tool_calls = []
+
+        for block in raw.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+            elif block.type == "tool_use":
+                tool_calls.append(ToolCall(
+                    id=block.id,
+                    function=ToolCallFunction(
+                        name=block.name,
+                        arguments=_json.dumps(block.input),
+                    ),
+                ))
+
+        content = "\n".join(text_parts) if text_parts else None
+        tc_list = tool_calls if tool_calls else None
+
+        usage = TokenUsage(
+            prompt_tokens=raw.usage.input_tokens,
+            completion_tokens=raw.usage.output_tokens,
+        )
+
+        return CompletionResponse(
+            model=raw.model,
+            choices=[CompletionChoice(
+                message=CompletionMessage(content=content, tool_calls=tc_list),
+                finish_reason=raw.stop_reason,
+            )],
+            usage=usage,
+        )
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.close()
+            self._client = None

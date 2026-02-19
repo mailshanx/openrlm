@@ -10,6 +10,7 @@ from arcgeneral.events import (
 from arcgeneral.llm import (
     LLMClient,
     OpenRouterClient,
+    AnthropicClient,
     CompletionResponse,
     CompletionChoice,
     CompletionMessage,

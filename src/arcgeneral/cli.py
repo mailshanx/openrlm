@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default="openai/gpt-5.2",
                         help="Model identifier (default: %(default)s)")
     parser.add_argument("--provider", type=str, default="openrouter",
-                        help="LLM provider — determines API key and endpoint (default: %(default)s)")
+                        help="LLM provider: 'openrouter' (default, routes to any model) or 'anthropic' (direct Anthropic API). Other providers route through OpenRouter.")
     parser.add_argument("--image", type=str, default=None,
                         help="Docker image tag for sandbox (omit for local mode)")
     parser.add_argument("--timeout", type=float, default=3600.0,

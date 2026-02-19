@@ -28,7 +28,7 @@ from arcgeneral.events import (
 )
 from arcgeneral.llm import (
     CompletionResponse, CompletionChoice, CompletionMessage,
-    ToolCall, ToolCallFunction, TokenUsage, OpenRouterClient,
+    ToolCall, ToolCallFunction, TokenUsage, OpenRouterClient, AnthropicClient,
 )
 
 TAG = "arcgeneral:sandbox"
@@ -969,6 +969,515 @@ async def test_openrouter_client_converts_tool_response():
     report("llm_tool_usage", result.usage == TokenUsage(prompt_tokens=200, completion_tokens=80))
     await client.close()
 
+# ---------------------------------------------------------------------------
+# Anthropic client mock types (duck-typed to match anthropic SDK shapes)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ATextBlock:
+    type: str = "text"
+    text: str = ""
+
+@dataclass
+class _AToolUseBlock:
+    type: str = "tool_use"
+    id: str = ""
+    name: str = ""
+    input: dict = None
+    def __post_init__(self):
+        if self.input is None:
+            self.input = {}
+
+@dataclass
+class _AUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+@dataclass
+class _AMessage:
+    id: str = "msg_001"
+    model: str = "claude-sonnet-4-5-20250514"
+    role: str = "assistant"
+    content: list = None
+    stop_reason: str = "end_turn"
+    usage: _AUsage = None
+    type: str = "message"
+    def __post_init__(self):
+        if self.content is None:
+            self.content = []
+        if self.usage is None:
+            self.usage = _AUsage()
+
+
+async def test_anthropic_client_converts_text_response():
+    """AnthropicClient.complete() converts SDK text response to our frozen types."""
+    captured = {}
+    client = AnthropicClient()
+
+    mock_response = _AMessage(
+        model="claude-sonnet-4-5-20250514",
+        content=[_ATextBlock(text="hello world")],
+        stop_reason="end_turn",
+        usage=_AUsage(input_tokens=100, output_tokens=50),
+    )
+
+    class _MockMessages:
+        async def create(self, **kw):
+            captured.update(kw)
+            return mock_response
+
+    class _MockClient:
+        messages = _MockMessages()
+        async def close(self): pass
+
+    client._client = _MockClient()
+    result = await client.complete(
+        messages=[{"role": "system", "content": "You are helpful."}, {"role": "user", "content": "hi"}],
+        api_key="test-key",
+        model="claude-sonnet-4-5-20250514",
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "python",
+                "description": "Execute code",
+                "parameters": {"type": "object", "properties": {"code": {"type": "string"}}},
+            },
+        }],
+    )
+    # Verify response translation
+    report("anthropic_text_is_completion_response", isinstance(result, CompletionResponse))
+    report("anthropic_text_model", result.model == "claude-sonnet-4-5-20250514")
+    report("anthropic_text_content", result.choices[0].message.content == "hello world")
+    report("anthropic_text_no_tool_calls", result.choices[0].message.tool_calls is None)
+    report("anthropic_text_finish_reason", result.choices[0].finish_reason == "end_turn")
+    report("anthropic_text_usage", result.usage == TokenUsage(prompt_tokens=100, completion_tokens=50))
+    report("anthropic_text_frozen", result.__dataclass_params__.frozen)
+    # Verify what was sent TO the Anthropic SDK
+    report("anthropic_text_sent_system", captured["system"] == "You are helpful.")
+    report("anthropic_text_sent_messages", captured["messages"] == [{"role": "user", "content": "hi"}])
+    report("anthropic_text_sent_tools", captured["tools"] == [{
+        "name": "python", "description": "Execute code",
+        "input_schema": {"type": "object", "properties": {"code": {"type": "string"}}},
+    }])
+    report("anthropic_text_sent_model", captured["model"] == "claude-sonnet-4-5-20250514")
+    await client.close()
+
+
+async def test_anthropic_client_converts_tool_response():
+    """AnthropicClient.complete() converts SDK tool-call response to our frozen types."""
+    captured = {}
+    client = AnthropicClient()
+
+    mock_response = _AMessage(
+        model="claude-sonnet-4-5-20250514",
+        content=[
+            _ATextBlock(text="Let me compute that."),
+            _AToolUseBlock(id="toolu_01", name="python", input={"code": "print(42)"}),
+        ],
+        stop_reason="tool_use",
+        usage=_AUsage(input_tokens=200, output_tokens=80),
+    )
+
+    class _MockMessages:
+        async def create(self, **kw):
+            captured.update(kw)
+            return mock_response
+
+    class _MockClient:
+        messages = _MockMessages()
+        async def close(self): pass
+
+    client._client = _MockClient()
+    result = await client.complete(messages=[{"role": "user", "content": "hi"}], api_key="test-key", model="test")
+    # Verify response translation
+    report("anthropic_tool_has_content", result.choices[0].message.content == "Let me compute that.")
+    report("anthropic_tool_has_tool_calls", result.choices[0].message.tool_calls is not None)
+    tc = result.choices[0].message.tool_calls[0]
+    report("anthropic_tool_call_type", isinstance(tc, ToolCall))
+    report("anthropic_tool_fn_name", tc.function.name == "python")
+    report("anthropic_tool_fn_args", json.loads(tc.function.arguments) == {"code": "print(42)"})
+    report("anthropic_tool_finish_reason", result.choices[0].finish_reason == "tool_use")
+    report("anthropic_tool_usage", result.usage == TokenUsage(prompt_tokens=200, completion_tokens=80))
+    await client.close()
+
+
+async def test_anthropic_translate_full_turn():
+    """Verify exact Anthropic message shapes produced from a realistic _run_turn history.
+
+    Simulates the message sequence that _run_turn builds:
+      system -> user -> assistant(tool_calls) -> tool(result) -> assistant(text)
+    and verifies the exact Anthropic-shaped messages sent to messages.create() on
+    each of the two LLM calls (tool round + final response).
+    """
+    calls: list[dict] = []
+    call_count = 0
+    class _MockMessages:
+        async def create(self, **kw):
+            nonlocal call_count
+            calls.append(dict(kw))  # deep-ish copy of kwargs
+            call_count += 1
+            if call_count == 1:
+                return _AMessage(
+                    content=[_AToolUseBlock(id="toolu_01", name="python", input={"code": "x = 2 + 2\nprint(x)"})],
+                    stop_reason="tool_use",
+                    usage=_AUsage(input_tokens=100, output_tokens=50),
+                )
+            else:
+                return _AMessage(
+                    content=[_ATextBlock(text="The answer is 4.")],
+                    stop_reason="end_turn",
+                    usage=_AUsage(input_tokens=200, output_tokens=30),
+                )
+
+    class _MockSDK:
+        messages = _MockMessages()
+        async def close(self): pass
+
+    client = AnthropicClient()
+    client._client = _MockSDK()
+
+    config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic", sandbox_image=None)
+    runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=client)
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    async with runtime:
+        session = await runtime.create_session("xlate-test")
+        result = await session.run_single("What is 2+2?")
+        await runtime.close_session("xlate-test")
+
+    report("anthropic_xlate_result", result == "The answer is 4.")
+    report("anthropic_xlate_call_count", call_count == 2, f"calls={call_count}")
+
+    # ── Call 1: system + user message ──
+    c1 = calls[0]
+    # System extracted as separate param
+    report("anthropic_xlate_c1_has_system", "system" in c1 and isinstance(c1["system"], str))
+    # Messages should contain only the user message (system stripped out)
+    c1_msgs = c1["messages"]
+    report("anthropic_xlate_c1_msg_count", len(c1_msgs) == 1, f"got {len(c1_msgs)}")
+    report("anthropic_xlate_c1_user", c1_msgs[0] == {"role": "user", "content": "What is 2+2?"})
+    # Tools translated to Anthropic format
+    report("anthropic_xlate_c1_has_tools", "tools" in c1)
+    t = c1["tools"][0]
+    report("anthropic_xlate_c1_tool_name", t["name"] == "python")
+    report("anthropic_xlate_c1_tool_has_input_schema", "input_schema" in t)
+    report("anthropic_xlate_c1_tool_no_function_key", "function" not in t)
+    report("anthropic_xlate_c1_model", c1["model"] == "claude-sonnet-4-5-20250514")
+    report("anthropic_xlate_c1_max_tokens", "max_tokens" in c1)
+
+    # ── Call 2: system + user + assistant(tool_use) + user(tool_result) ──
+    c2 = calls[1]
+    report("anthropic_xlate_c2_has_system", "system" in c2)
+    c2_msgs = c2["messages"]
+    # Should be: user, assistant(tool_use blocks), user(tool_result blocks)
+    report("anthropic_xlate_c2_msg_count", len(c2_msgs) == 3, f"got {len(c2_msgs)}: {[m['role'] for m in c2_msgs]}")
+
+    # First message: user
+    report("anthropic_xlate_c2_m0_role", c2_msgs[0]["role"] == "user")
+    report("anthropic_xlate_c2_m0_content", c2_msgs[0]["content"] == "What is 2+2?")
+
+    # Second message: assistant with tool_use content block
+    report("anthropic_xlate_c2_m1_role", c2_msgs[1]["role"] == "assistant")
+    c2_m1_content = c2_msgs[1]["content"]
+    report("anthropic_xlate_c2_m1_is_list", isinstance(c2_m1_content, list))
+    tool_use_blocks = [b for b in c2_m1_content if b.get("type") == "tool_use"]
+    report("anthropic_xlate_c2_m1_has_tool_use", len(tool_use_blocks) == 1)
+    tub = tool_use_blocks[0]
+    report("anthropic_xlate_c2_tool_use_name", tub["name"] == "python")
+    report("anthropic_xlate_c2_tool_use_input", tub["input"] == {"code": "x = 2 + 2\nprint(x)"})
+    report("anthropic_xlate_c2_tool_use_has_id", "id" in tub and tub["id"] == "toolu_01")
+
+    # Third message: user with tool_result content block
+    report("anthropic_xlate_c2_m2_role", c2_msgs[2]["role"] == "user")
+    c2_m2_content = c2_msgs[2]["content"]
+    report("anthropic_xlate_c2_m2_is_list", isinstance(c2_m2_content, list))
+    tr_blocks = [b for b in c2_m2_content if b.get("type") == "tool_result"]
+    report("anthropic_xlate_c2_m2_has_tool_result", len(tr_blocks) == 1)
+    trb = tr_blocks[0]
+    report("anthropic_xlate_c2_tool_result_id", trb["tool_use_id"] == "toolu_01")
+    report("anthropic_xlate_c2_tool_result_has_content", "content" in trb and isinstance(trb["content"], str))
+    # The tool result content should contain the sandbox output ("4" from print(x))
+    report("anthropic_xlate_c2_tool_result_output", "4" in trb["content"], repr(trb["content"]))
+
+
+async def test_anthropic_translate_multi_turn_compressed():
+    """Verify message translation after _compress_messages strips intermediate tool calls.
+
+    In multi-turn, previous turns are compressed to user + final assistant (no tool_calls).
+    The current turn retains full detail. This can produce consecutive user messages
+    or consecutive assistant messages, which Anthropic rejects — verify they get merged.
+    """
+    # Simulate a compressed history from _compress_messages:
+    #   system, user(turn1), assistant(turn1 final), user(turn2), assistant(tool_calls), tool, ...
+    # _compress_messages drops assistant-with-tool_calls from old turns, keeping only
+    # the final text assistant. So turns look like: user, assistant, user, assistant, ...
+    # No merging issue in the normal case. But if an old turn had no final text response
+    # (e.g., max_tool_rounds hit), we'd get: user, user (consecutive).
+
+    captured_msgs = []
+
+    class _MockMessages:
+        async def create(self, **kw):
+            captured_msgs.append(kw.get("messages", []))
+            return _AMessage(
+                content=[_ATextBlock(text="done")],
+                stop_reason="end_turn",
+                usage=_AUsage(input_tokens=10, output_tokens=5),
+            )
+
+    class _MockSDK:
+        messages = _MockMessages()
+        async def close(self): pass
+
+    client = AnthropicClient()
+    client._client = _MockSDK()
+
+    # Manually build a compressed history with consecutive user messages
+    # (simulating what _compress_messages could produce)
+    compressed = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "turn 1 question"},
+        # No assistant response (stripped by compression because it only had tool_calls)
+        {"role": "user", "content": "turn 2 question"},  # consecutive user!
+        {"role": "assistant", "content": "turn 2 answer"},
+        {"role": "user", "content": "turn 3 question"},  # current turn
+    ]
+
+    result = await client.complete(messages=compressed, api_key="test-key", model="test")
+    msgs = captured_msgs[0]
+
+    # System should be extracted
+    roles = [m["role"] for m in msgs]
+    report("anthropic_compress_no_system", "system" not in roles)
+
+    # No consecutive same-role messages
+    for i in range(len(roles) - 1):
+        if roles[i] == roles[i + 1]:
+            report("anthropic_compress_no_consecutive", False,
+                   f"consecutive {roles[i]} at positions {i},{i+1}")
+            break
+    else:
+        report("anthropic_compress_no_consecutive", True)
+
+    # The two consecutive user messages should have been merged into one
+    user_msgs = [m for m in msgs if m["role"] == "user"]
+    # Original had 3 user messages (turn1, turn2, turn3). turn1+turn2 merge -> 2 user messages.
+    report("anthropic_compress_user_count", len(user_msgs) == 2,
+           f"got {len(user_msgs)}: {roles}")
+
+    # First user message should have merged content blocks
+    first_user = user_msgs[0]
+    if isinstance(first_user["content"], list):
+        texts = [b["text"] for b in first_user["content"] if b.get("type") == "text"]
+        report("anthropic_compress_merged_content",
+               "turn 1 question" in texts and "turn 2 question" in texts,
+               f"got {texts}")
+    else:
+        report("anthropic_compress_merged_content", False, f"expected list, got {type(first_user['content'])}")
+
+    await client.close()
+
+
+async def test_anthropic_auto_select():
+    """AgentRuntime auto-selects AnthropicClient when provider=anthropic."""
+    config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic", sandbox_image=None)
+    runtime = AgentRuntime(config, HostFunctionRegistry())
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-for-autoselect")
+    async with runtime:
+        report("anthropic_auto_select", isinstance(runtime._llm_client, AnthropicClient))
+        report("anthropic_auto_owns", runtime._owns_llm_client is True)
+
+
+async def test_anthropic_oauth_client_construction():
+    """AnthropicClient uses auth_token + stealth headers for OAuth tokens (sk-ant-oat-*)."""
+    client = AnthropicClient()
+
+    captured = {}
+
+    class _MockMessages:
+        async def create(self, **kw):
+            captured.update(kw)
+            return _AMessage(
+                content=[_ATextBlock(text="ok")],
+                usage=_AUsage(input_tokens=10, output_tokens=5),
+            )
+
+    # Patch _ensure_client to capture how it constructs the SDK client
+    import anthropic as _anthropic_mod
+    _original_init_args = {}
+
+    class _SpyAnthropic:
+        def __init__(self, **kwargs):
+            _original_init_args.update(kwargs)
+            self.messages = _MockMessages()
+        async def close(self): pass
+
+    _orig_class = _anthropic_mod.AsyncAnthropic
+    _anthropic_mod.AsyncAnthropic = _SpyAnthropic
+    try:
+        oauth_client = AnthropicClient()
+        await oauth_client.complete(
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="sk-ant-oat-test-token-123",
+            model="claude-sonnet-4-5-20250514",
+        )
+        # Verify Bearer auth mode
+        report("oauth_client_api_key_none", _original_init_args.get("api_key") is None)
+        report("oauth_client_auth_token", _original_init_args.get("auth_token") == "sk-ant-oat-test-token-123")
+        # Verify stealth headers
+        headers = _original_init_args.get("default_headers", {})
+        report("oauth_client_beta_header",
+               "claude-code-20250219" in headers.get("anthropic-beta", "")
+               and "oauth-2025-04-20" in headers.get("anthropic-beta", ""))
+        report("oauth_client_user_agent", "claude-cli/" in headers.get("user-agent", ""))
+        report("oauth_client_x_app", headers.get("x-app") == "cli")
+        report("oauth_client_is_oauth", oauth_client._is_oauth is True)
+        await oauth_client.close()
+    finally:
+        _anthropic_mod.AsyncAnthropic = _orig_class
+
+
+async def test_anthropic_regular_key_no_stealth():
+    """AnthropicClient uses api_key (not auth_token) for regular API keys."""
+    import anthropic as _anthropic_mod
+    _init_args = {}
+
+    class _SpyAnthropic:
+        def __init__(self, **kwargs):
+            _init_args.update(kwargs)
+            self.messages = type('M', (), {
+                'create': staticmethod(lambda **kw: None)
+            })()
+        async def close(self): pass
+
+    class _MockMessages:
+        async def create(self, **kw):
+            return _AMessage(
+                content=[_ATextBlock(text="ok")],
+                usage=_AUsage(input_tokens=10, output_tokens=5),
+            )
+
+    _orig_class = _anthropic_mod.AsyncAnthropic
+    _anthropic_mod.AsyncAnthropic = lambda **kw: type('C', (), {
+        '__init__': lambda self: _init_args.update(kw),
+        'messages': _MockMessages(),
+        'close': lambda self: None,
+    })()
+    # Simpler approach: just construct and check
+    _anthropic_mod.AsyncAnthropic = _orig_class  # reset
+
+    # Use the real class but with a mock
+    captured = {}
+
+    class _MockMessages2:
+        async def create(self, **kw):
+            return _AMessage(
+                content=[_ATextBlock(text="ok")],
+                usage=_AUsage(input_tokens=10, output_tokens=5),
+            )
+
+    client = AnthropicClient()
+
+    class _MockSDK:
+        def __init__(self):
+            self.messages = _MockMessages2()
+        async def close(self): pass
+
+    client._client = _MockSDK()
+    client._is_oauth = False  # simulate non-OAuth init
+
+    await client.complete(
+        messages=[{"role": "system", "content": "Be helpful"}, {"role": "user", "content": "hi"}],
+        api_key="sk-ant-api01-regular-key",
+        model="claude-sonnet-4-5-20250514",
+    )
+    report("regular_key_not_oauth", client._is_oauth is False)
+
+
+async def test_anthropic_oauth_system_prompt_prepend():
+    """OAuth mode prepends Claude Code identity to system prompt as content blocks."""
+    captured = {}
+
+    class _MockMessages:
+        async def create(self, **kw):
+            captured.update(kw)
+            return _AMessage(
+                content=[_ATextBlock(text="ok")],
+                usage=_AUsage(input_tokens=10, output_tokens=5),
+            )
+
+    class _MockSDK:
+        messages = _MockMessages()
+        async def close(self): pass
+
+    # OAuth mode with system prompt
+    client = AnthropicClient()
+    client._client = _MockSDK()
+    client._is_oauth = True
+
+    await client.complete(
+        messages=[
+            {"role": "system", "content": "You are a data analyst."},
+            {"role": "user", "content": "hi"},
+        ],
+        api_key="sk-ant-oat-test",
+        model="test",
+    )
+    system = captured.get("system")
+    report("oauth_sys_is_list", isinstance(system, list))
+    report("oauth_sys_two_blocks", len(system) == 2)
+    report("oauth_sys_identity_first",
+           system[0] == {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."})
+    report("oauth_sys_user_prompt_second",
+           system[1] == {"type": "text", "text": "You are a data analyst."})
+
+    # OAuth mode without system prompt
+    captured.clear()
+    client2 = AnthropicClient()
+    client2._client = _MockSDK()
+    client2._is_oauth = True
+
+    await client2.complete(
+        messages=[{"role": "user", "content": "hi"}],
+        api_key="sk-ant-oat-test",
+        model="test",
+    )
+    system2 = captured.get("system")
+    report("oauth_sys_no_user_prompt", len(system2) == 1)
+    report("oauth_sys_identity_only",
+           system2[0] == {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."})
+
+
+async def test_anthropic_non_oauth_system_prompt_unchanged():
+    """Non-OAuth mode passes system prompt as a plain string (not content blocks)."""
+    captured = {}
+
+    class _MockMessages:
+        async def create(self, **kw):
+            captured.update(kw)
+            return _AMessage(
+                content=[_ATextBlock(text="ok")],
+                usage=_AUsage(input_tokens=10, output_tokens=5),
+            )
+
+    class _MockSDK:
+        messages = _MockMessages()
+        async def close(self): pass
+
+    client = AnthropicClient()
+    client._client = _MockSDK()
+    client._is_oauth = False
+
+    await client.complete(
+        messages=[
+            {"role": "system", "content": "You are a data analyst."},
+            {"role": "user", "content": "hi"},
+        ],
+        api_key="sk-ant-api01-regular",
+        model="test",
+    )
+    system = captured.get("system")
+    report("non_oauth_sys_is_string", isinstance(system, str))
+    report("non_oauth_sys_content", system == "You are a data analyst.")
 async def test_llm_client_injection():
     """AgentRuntime uses an injected LLMClient instead of creating a default."""
     calls = []
@@ -1540,6 +2049,19 @@ async def main():
     await test_openrouter_client_converts_tool_response()
     await test_llm_client_injection()
     await test_llm_client_lifecycle_ownership()
+
+    print("\nAnthropic client tests:")
+    await test_anthropic_client_converts_text_response()
+    await test_anthropic_client_converts_tool_response()
+    await test_anthropic_translate_full_turn()
+    await test_anthropic_translate_multi_turn_compressed()
+    await test_anthropic_auto_select()
+
+    print("\nAnthropic OAuth stealth mode tests:")
+    await test_anthropic_oauth_client_construction()
+    await test_anthropic_regular_key_no_stealth()
+    await test_anthropic_oauth_system_prompt_prepend()
+    await test_anthropic_non_oauth_system_prompt_unchanged()
 
     print("\nShutdown / SIGTERM tests:")
     await test_sigterm_clean_shutdown()

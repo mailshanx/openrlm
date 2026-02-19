@@ -21,7 +21,7 @@ arcgeneral has two layers: a **core** that handles single-message execution, and
 
 The core takes a single message and runs a complete LLM↔REPL loop: the LLM emits a `python` tool call, the core executes it in a persistent IPython sandbox, returns the output, and repeats until the LLM responds with text. Everything — computation, file I/O, web requests, sub-agent orchestration — is Python code the LLM writes and runs through that single tool. Host functions you register appear as plain `await fn(...)` calls inside the sandbox. Sub-agent functions (`create_agent`, `run_agent`, `await_result`) work the same way — the LLM doesn’t know these are remote calls.
 
-`AgentRuntime` owns the infrastructure: the fork server (process lifecycle), the host function server (HTTP bridge for custom tools), the LLM client (pluggable — default is OpenRouter), and sub-agent routing. It routes sub-agent calls through flat lookup tables so agents at any nesting depth resolve to the correct session.
+`AgentRuntime` owns the infrastructure: the fork server (process lifecycle), the host function server (HTTP bridge for custom tools), the LLM client (pluggable — built-in support for OpenRouter and Anthropic), and sub-agent routing. It routes sub-agent calls through flat lookup tables so agents at any nesting depth resolve to the correct session.
 
 ```python
 import asyncio
@@ -280,7 +280,7 @@ The maximum recursion depth is configurable (default: 10 levels).
 | Parameter | Default | Description |
 |---|---|---|
 | `model` | `"openai/gpt-5.2"` | Model identifier |
-| `provider` | `"openrouter"` | LLM provider (determines API key and endpoint) |
+| `provider` | `"openrouter"` | LLM provider: `"openrouter"` (default) or `"anthropic"` for native Anthropic API |
 | `sandbox_image` | `None` | Docker image tag; `None` for local mode |
 | `code_timeout` | `3600.0` | Code execution timeout in seconds |
 | `max_tool_rounds` | `50` | Max LLM-tool iterations per turn |
@@ -381,47 +381,47 @@ arcgeneral --functions ./contrib "search for recent papers on transformer effici
 ```
 
 ## LLM Client
-The default client uses [OpenRouter](https://openrouter.ai/), which provides access to models from OpenAI, Anthropic, Google, and others through a single API. It manages a persistent HTTP/2 connection pool internally and cleans it up when the runtime exits.
+arcgeneral ships with two built-in providers:
 
-To use a different provider, implement the `LLMClient` protocol and inject it:
+- **OpenRouter** (default) — routes to models from OpenAI, Anthropic, Google, and others through a single API.
+- **Anthropic** — calls the Anthropic API directly.
+
 ```python
-import httpx
+# OpenRouter (default) — model names are provider-prefixed
+config = AgentConfig(model="openai/gpt-5.2", provider="openrouter")
+
+# Anthropic — bare model names
+config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic")
+```
+
+Both manage HTTP connection pools internally and clean up when the runtime exits.
+
+For other providers, implement the `LLMClient` protocol and inject it:
+
+```python
 from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
 from arcgeneral import LLMClient, CompletionResponse, CompletionChoice, CompletionMessage, TokenUsage
 
-class AnthropicDirectClient:
-    """Example: call Anthropic's API directly instead of through OpenRouter."""
-
-    def __init__(self):
-        self._http = httpx.AsyncClient(base_url="https://api.anthropic.com")
+class MyCustomClient:
+    """Example: implement LLMClient for a provider not built in."""
 
     async def complete(self, messages, *, api_key, **kwargs) -> CompletionResponse:
-        resp = await self._http.post("/v1/messages", headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        }, json={"model": kwargs.get("model", "claude-sonnet-4-5-20250514"), "messages": messages, "max_tokens": 4096})
-        data = resp.json()
+        # Call your provider's API, then translate the response:
         return CompletionResponse(
-            model=data["model"],
+            model="my-model",
             choices=[CompletionChoice(
-                message=CompletionMessage(content=data["content"][0]["text"], tool_calls=None),
-                finish_reason=data["stop_reason"],
+                message=CompletionMessage(content="...", tool_calls=None),
+                finish_reason="stop",
             )],
-            usage=TokenUsage(
-                prompt_tokens=data["usage"]["input_tokens"],
-                completion_tokens=data["usage"]["output_tokens"],
-            ),
+            usage=TokenUsage(prompt_tokens=0, completion_tokens=0),
         )
 
     async def close(self) -> None:
-        """Release the HTTP connection pool."""
-        await self._http.aclose()
-
+        pass  # Release any resources
 
 async def main():
-    client = AnthropicDirectClient()
-    config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic")
-    runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=client)
+    client = MyCustomClient()
+    runtime = AgentRuntime(AgentConfig(), HostFunctionRegistry(), llm_client=client)
 
     try:
         async with runtime:
@@ -434,8 +434,6 @@ async def main():
         # The runtime only auto-closes clients it created itself.
         await client.close()
 ```
-
-The `close()` method releases whatever resources your client holds — typically an HTTP connection pool. When the runtime creates its own default `OpenRouterClient`, it handles closing automatically on exit. When you inject a client, you own its lifecycle.
 
 ## Development
 
