@@ -373,24 +373,61 @@ arcgeneral --functions ./contrib "search for recent papers on transformer effici
 4. **Cancellation.** Ctrl-C during an active turn cancels the turn and rolls back the message history to the last consistent checkpoint. Double Ctrl-C exits the session. Sub-agent tasks are cancelled transitively.
 
 ## LLM Client
-
-The default client uses [OpenRouter](https://openrouter.ai/), which provides access to models from OpenAI, Anthropic, Google, and others through a single API.
+The default client uses [OpenRouter](https://openrouter.ai/), which provides access to models from OpenAI, Anthropic, Google, and others through a single API. It manages a persistent HTTP/2 connection pool internally and cleans it up when the runtime exits.
 
 To use a different provider, implement the `LLMClient` protocol and inject it:
-
 ```python
-from arcgeneral import LLMClient, CompletionResponse
+import httpx
+from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
+from arcgeneral import LLMClient, CompletionResponse, CompletionChoice, CompletionMessage, TokenUsage
 
-class MyClient:
+class AnthropicDirectClient:
+    """Example: call Anthropic's API directly instead of through OpenRouter."""
+
+    def __init__(self):
+        self._http = httpx.AsyncClient(base_url="https://api.anthropic.com")
+
     async def complete(self, messages, *, api_key, **kwargs) -> CompletionResponse:
-        ...
-    async def close(self):
-        ...
+        resp = await self._http.post("/v1/messages", headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }, json={"model": kwargs.get("model", "claude-sonnet-4-5-20250514"), "messages": messages, "max_tokens": 4096})
+        data = resp.json()
+        return CompletionResponse(
+            model=data["model"],
+            choices=[CompletionChoice(
+                message=CompletionMessage(content=data["content"][0]["text"], tool_calls=None),
+                finish_reason=data["stop_reason"],
+            )],
+            usage=TokenUsage(
+                prompt_tokens=data["usage"]["input_tokens"],
+                completion_tokens=data["usage"]["output_tokens"],
+            ),
+        )
 
-runtime = AgentRuntime(config, registry, llm_client=MyClient())
+    async def close(self) -> None:
+        """Release the HTTP connection pool."""
+        await self._http.aclose()
+
+
+async def main():
+    client = AnthropicDirectClient()
+    config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic")
+    runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=client)
+
+    try:
+        async with runtime:
+            session = await runtime.create_session("s1")
+            result = await session.run_single("What is 2 + 2?")
+            print(result)
+            await runtime.close_session("s1")
+    finally:
+        # You injected the client, so you close it.
+        # The runtime only auto-closes clients it created itself.
+        await client.close()
 ```
 
-The runtime does not close injected clients — you manage their lifecycle.
+The `close()` method releases whatever resources your client holds — typically an HTTP connection pool. When the runtime creates its own default `OpenRouterClient`, it handles closing automatically on exit. When you inject a client, you own its lifecycle.
 
 ## Development
 
