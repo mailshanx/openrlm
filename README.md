@@ -146,24 +146,25 @@ asyncio.run(main())
 ```
 
 #### Multi-turn
-
-Call `run_single()` repeatedly on the same session. Messages accumulate and REPL state (variables, imports, computed results) persists across turns:
-
+Call `run_single()` repeatedly on the same session. The Session manages the full conversation history internally — you don't construct or pass messages. Each call appends a user message, runs the agent loop (which may involve multiple LLM/tool-call rounds), and returns the final assistant response as a string. REPL state (variables, imports, computed results) also persists across turns.
 ```python
 async with runtime:
     session = await runtime.create_session("analysis")
+    # Turn 1: agent loads data, stores DataFrame in a REPL variable
+    response = await session.run_single("Load data.csv and show me the column names")
+    print(response)  # "The file has columns: date, product, price, volume ..."
 
-    await session.run_single("Load data.csv and show me the column names")
-    # Agent loads the file, stores it in a variable
+    # Turn 2: agent reuses the loaded DataFrame — no re-reading needed
+    response = await session.run_single("What's the correlation between price and volume?")
+    print(response)  # "The Pearson correlation is 0.73 ..."
 
-    await session.run_single("What's the correlation between price and volume?")
-    # Agent reuses the loaded data — no re-reading needed
-
-    result = await session.run_single("Plot the top 5 outliers and save to outliers.png")
-    # Agent builds on all prior computed state
-
+    # Turn 3: agent builds on all prior computed state
+    response = await session.run_single("Plot the top 5 outliers and save to outliers.png")
+    print(response)  # "Saved outliers.png with 5 data points highlighted ..."
     await runtime.close_session("analysis")
 ```
+
+The caller's only job is to provide the user message and consume the response string. Everything else — message accumulation, compression of older turns, tool call execution, history synchronization to the REPL — happens inside the Session.
 
 ### Custom Host Functions
 
