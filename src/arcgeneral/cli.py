@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("message", type=str, nargs="?", default=None,
                         help="User message (omit for interactive session)")
-    parser.add_argument("--model", type=str, default="z-ai/glm-5",
+    parser.add_argument("--model", type=str, default="openai/gpt-5.2",
                         help="Model identifier (default: %(default)s)")
     parser.add_argument("--provider", type=str, default="openrouter",
                         help="LLM provider — determines API key and endpoint (default: %(default)s)")

@@ -63,7 +63,7 @@ def report(name: str, ok: bool, detail: str = ""):
 async def test_config_defaults():
     c = AgentConfig()
     report("config_defaults", all([
-        c.model == "openai/gpt-4o",
+        c.model == "openai/gpt-5.2",
         c.provider == "openrouter",
         c.system_prompt is None,
         c.sandbox_image is None,

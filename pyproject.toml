@@ -1,8 +1,9 @@
 [project]
 name = "arcgeneral"
 version = "0.1.0"
-description = "LLM agent with stateful IPython REPL tool"
+description = "RLM based agent harness and CLI with persistent iPython repl tool"
 requires-python = ">=3.13"
+license = "MIT"
 dependencies = [
     "aiodocker>=0.23.0",
     "openrouter>=0.6.0",

@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class AgentConfig:
-    model: str = "openai/gpt-4o"
+    model: str = "openai/gpt-5.2"
     provider: str = "openrouter"
     get_api_key: Callable[[str], Awaitable[str]] | None = None
     system_prompt: str | None = None
