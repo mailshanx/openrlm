@@ -19,7 +19,7 @@ from arcgeneral.llm import (
     PROVIDER_ENV_VARS,
     default_api_key_resolver,
 )
-from arcgeneral.agent import Session
+from arcgeneral.agent import Session, RuntimeServices
 from arcgeneral.agent import AgentRuntime
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry

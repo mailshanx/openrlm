@@ -620,16 +620,16 @@ async def test_host_function_path_serialization():
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
-    # Replace _run_turn: skip LLM, just execute the task string as code.
-    async def _mock_run_turn(full_history, sandbox, config, request_kwargs, agent_label="", on_event=None):
+    # Replace _run_turn on session: skip LLM, just execute the task string as code.
+    async def _mock_run_turn(full_history, sandbox, request_kwargs, agent_label=""):
         task = full_history[-1]["content"]
         result = await sandbox.execute(task, timeout=30.0)
         full_history.append({"role": "assistant", "content": result})
         return result
-    runtime._run_turn = _mock_run_turn
 
     async with runtime:
         session = await runtime.create_session("test")
+        session._run_turn = _mock_run_turn
         sb = session._sandbox
         # Step 1: basic sandbox works
         r = await sb.execute("print('hello')", timeout=10)
@@ -749,13 +749,13 @@ async def test_event_emission_two_rounds():
     async with runtime:
         session = await runtime.create_session("test")
         events = []
+        session._on_event = events.append
         runtime._llm_call = mock_llm
         messages = list(session._messages)
         messages.append({"role": "user", "content": "What is 2+2?"})
-        result = await runtime._run_turn(
-            messages, session._sandbox, runtime._config,
+        result = await session._run_turn(
+            messages, session._sandbox,
             session._request_kwargs, agent_label="main",
-            on_event=events.append
         )
 
         check("event_count_9", lambda: len(events) == 9, f"got {len(events)}")
@@ -788,13 +788,13 @@ async def test_event_emission_immediate():
     async with runtime:
         session = await runtime.create_session("test")
         events = []
+        session._on_event = events.append
         runtime._llm_call = mock_llm
         messages = list(session._messages)
         messages.append({"role": "user", "content": "Hi"})
-        result = await runtime._run_turn(
-            messages, session._sandbox, runtime._config,
+        result = await session._run_turn(
+            messages, session._sandbox,
             session._request_kwargs, agent_label="main",
-            on_event=events.append
         )
 
         check("event_imm_count_4", lambda: len(events) == 4, f"got {len(events)}")
@@ -819,13 +819,13 @@ async def test_event_callback_error_isolation():
         session = await runtime.create_session("test")
         def exploding_callback(event):
             raise ValueError("consumer bug")
+        session._on_event = exploding_callback
         runtime._llm_call = mock_llm
         messages = list(session._messages)
         messages.append({"role": "user", "content": "Test"})
-        result = await runtime._run_turn(
-            messages, session._sandbox, runtime._config,
+        result = await session._run_turn(
+            messages, session._sandbox,
             session._request_kwargs, agent_label="main",
-            on_event=exploding_callback
         )
         check("event_error_isolation", lambda: result == "Survived")
 
@@ -845,9 +845,9 @@ async def test_event_no_callback():
         runtime._llm_call = mock_llm
         messages = list(session._messages)
         messages.append({"role": "user", "content": "Test"})
-        result = await runtime._run_turn(
-            messages, session._sandbox, runtime._config,
-            session._request_kwargs, agent_label="main"
+        result = await session._run_turn(
+            messages, session._sandbox,
+            session._request_kwargs, agent_label="main",
         )
         check("event_no_callback", lambda: result == "No events")
 
@@ -891,10 +891,9 @@ print(f'sub says: {result}')"""
         runtime._llm_call = mock_llm
         messages = list(session._messages)
         messages.append({"role": "user", "content": "Use a sub-agent"})
-        result = await runtime._run_turn(
-            messages, session._sandbox, runtime._config,
+        result = await session._run_turn(
+            messages, session._sandbox,
             session._request_kwargs, agent_label="main",
-            on_event=session._on_event
         )
 
         check("event_sub_count_13", lambda: len(events) == 13, f"got {len(events)}")
@@ -1098,9 +1097,9 @@ async def test_sigterm_cancels_inflight_subtasks():
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
-    # Mock _run_turn: for sub-agents, sleep forever to simulate long work
+    # Mock _run_turn on session: for sub-agents, sleep forever to simulate long work
     cancelled = []
-    async def _mock_run_turn(full_history, sandbox, config, request_kwargs, agent_label="", on_event=None):
+    async def _mock_run_turn(full_history, sandbox, request_kwargs, agent_label=""):
         if agent_label != "main":
             try:
                 await asyncio.sleep(3600)  # simulate long sub-agent work
@@ -1111,10 +1110,10 @@ async def test_sigterm_cancels_inflight_subtasks():
         result = await sandbox.execute(task, timeout=30.0)
         full_history.append({"role": "assistant", "content": result})
         return result
-    runtime._run_turn = _mock_run_turn
 
     async with runtime:
         session = await runtime.create_session("test")
+        session._run_turn = _mock_run_turn
         sb = session._sandbox
 
         # Create a sub-agent and start a long-running task
@@ -1186,8 +1185,8 @@ async def test_cancellation_rolls_back_history():
 
         # Start _run_turn as a task so we can cancel it
         turn_task = asyncio.create_task(
-            runtime._run_turn(
-                messages, session._sandbox, config,
+            session._run_turn(
+                messages, session._sandbox,
                 session._request_kwargs, agent_label="main",
             )
         )
@@ -1317,7 +1316,7 @@ async def test_cancel_run_single_cleans_subtasks():
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     cancelled_agents = []
-    async def _mock_run_turn(full_history, sandbox, config, request_kwargs, agent_label="main", on_event=None):
+    async def _mock_run_turn(full_history, sandbox, request_kwargs, agent_label="main"):
         if agent_label != "main":
             # Sub-agent: sleep forever until cancelled
             try:
@@ -1337,10 +1336,10 @@ async def test_cancel_run_single_cleans_subtasks():
             result = await sandbox.execute(task, timeout=30.0)
             full_history.append({"role": "assistant", "content": result})
             return result
-    runtime._run_turn = _mock_run_turn
 
     async with runtime:
         session = await runtime.create_session("cli")
+        session._run_turn = _mock_run_turn
         turn_task = asyncio.create_task(
             session.run_single("spawn_and_hang")
         )

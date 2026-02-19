@@ -1,16 +1,15 @@
 import asyncio
 import logging
 import json
-import os
 import time
 import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
+from typing import Awaitable, Callable, Self
 
-from arcgeneral.llm import LLMClient, OpenRouterClient, default_api_key_resolver
+from arcgeneral.llm import LLMClient, OpenRouterClient, CompletionResponse, default_api_key_resolver
 
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
@@ -126,12 +125,38 @@ class _SubAgent:
         self.lock = asyncio.Lock()
 
 
-class Session:
-    """A single conversation with its own REPL, message history, and sub-agent tree."""
+# ---------------------------------------------------------------------------
+# RuntimeServices — the narrow interface Session uses to access infrastructure
+# ---------------------------------------------------------------------------
 
-    def __init__(self, runtime: 'AgentRuntime', sandbox: Sandbox, messages: list,
+@dataclass(frozen=True)
+class RuntimeServices:
+    """Infrastructure capabilities provided by AgentRuntime to each Session.
+
+    Session stores this instead of a back-reference to the full Runtime.
+    This is the only coupling between Session and Runtime.
+    """
+    llm_call: Callable[[list[dict], dict], Awaitable[CompletionResponse]]
+    create_sandbox: Callable[[], Awaitable[Sandbox]]
+    init_messages: Callable[[AgentConfig, str | None], tuple[list, dict]]
+    config: AgentConfig
+    spool_dir: Path
+
+
+# ---------------------------------------------------------------------------
+# Session — one conversation with its own REPL, message history, sub-agent tree
+# ---------------------------------------------------------------------------
+
+class Session:
+    """A single conversation with its own REPL, message history, and sub-agent tree.
+
+    Owns the agent loop (_run_turn) and all sub-agent lifecycle. Uses RuntimeServices
+    for infrastructure (LLM calls, sandbox creation, message initialization).
+    """
+
+    def __init__(self, services: RuntimeServices, sandbox: Sandbox, messages: list,
                  request_kwargs: dict, session_id: str, on_event=None):
-        self._runtime = runtime
+        self._services = services
         self._sandbox = sandbox
         self._messages = messages
         self._request_kwargs = request_kwargs
@@ -145,6 +170,9 @@ class Session:
     def session_id(self) -> str:
         """The caller-provided session ID."""
         return self._session_id
+
+    # ── Public API ──
+
     async def run_single(self, user_message: str) -> str:
         """Run the agent loop for a single message. Returns the final text response.
 
@@ -155,10 +183,9 @@ class Session:
             logger.info("[user] %s", user_message)
             self._messages.append({"role": "user", "content": user_message})
             try:
-                result = await self._runtime._run_turn(
-                    self._messages, self._sandbox, self._runtime._config,
-                    self._request_kwargs, agent_label="main",
-                    on_event=self._on_event,
+                result = await self._run_turn(
+                    self._messages, self._sandbox, self._request_kwargs,
+                    agent_label="main",
                 )
                 logger.info("[assistant] %s", result)
                 return result
@@ -178,11 +205,14 @@ class Session:
                 raise
 
     async def close(self):
-        """Close this session: cancel tasks, destroy sandboxes, unregister from runtime."""
+        """Close this session: cancel tasks, destroy sandboxes.
+
+        Does NOT unregister from Runtime's routing tables — that is
+        AgentRuntime.close_session()'s responsibility.
+        """
         # Cancel running background tasks
         for task_id, t in list(self._running_tasks.items()):
             t.cancel()
-            self._runtime._task_to_session.pop(task_id, None)
         if self._running_tasks:
             await asyncio.gather(*self._running_tasks.values(), return_exceptions=True)
         self._running_tasks.clear()
@@ -194,7 +224,6 @@ class Session:
                     await sub.sandbox.close()
                 except Exception:
                     logger.warning("Failed to destroy sub-agent %s sandbox", agent_id, exc_info=True)
-            self._runtime._agent_to_session.pop(agent_id, None)
         self._sub_agents.clear()
 
         # Destroy session sandbox
@@ -206,290 +235,85 @@ class Session:
             finally:
                 self._sandbox = None
 
-        # Unregister from runtime
-        self._runtime._agent_to_session.pop(self._session_id, None)
-        self._runtime._sessions.pop(self._session_id, None)
+    # ── Sub-agent management (called by Runtime's host function routing) ──
 
+    def get_agent_depth(self, agent_id: str) -> int:
+        """Return the depth of an agent in this session's tree. Root = 0."""
+        sub = self._sub_agents.get(agent_id)
+        return sub.depth if sub else 0
 
-class AgentRuntime:
-    """Owns the infrastructure lifecycle: host function server, fork server, LLM client.
-    Creates sessions for independent conversations."""
-
-    def __init__(self, config: AgentConfig, registry: HostFunctionRegistry, llm_client: LLMClient | None = None):
-        self._config = config
-        self._registry = registry
-        self._server: HostFunctionServer | None = None
-        self._fork_server: ForkServer | None = None
-        self._llm_client = llm_client
-        self._owns_llm_client = llm_client is None
-
-        # Session tracking
-        self._sessions: dict[str, Session] = {}
-        self._agent_to_session: dict[str, Session] = {}
-        self._task_to_session: dict[str, Session] = {}
-
-        # Spool dir for truncated output (temp dir, cleaned up on __aexit__)
-        self._spool_dir: Path | None = None
-
-        # Register runtime host functions into the registry (before server starts,
-        # so they appear in the system prompt and get kernel stubs).
-        registry.register("create_agent", self._host_create_agent)
-        registry.register("run_agent", self._host_run_agent)
-        registry.register(
-            "await_result",
-            self._host_await_result,
-            timeout=max(config.code_timeout - 30, 30),
+    def register_sub_agent(self, agent_id: str, instructions: str, depth: int) -> None:
+        """Register a new sub-agent in this session's agent tree."""
+        logger.info("[session %s] Registered sub-agent %s (depth=%d)", self._session_id, agent_id, depth)
+        self._sub_agents[agent_id] = _SubAgent(
+            instructions=instructions,
+            depth=depth,
         )
 
-    async def __aenter__(self) -> Self:
-        # Start shared host function server
-        if self._registry.names:
-            self._server = HostFunctionServer(self._registry)
-            await self._server.__aenter__()
+    async def start_sub_task(self, agent_id: str, task: str) -> str:
+        """Start a background task on a sub-agent. Returns task_id.
 
-        # Create temp spool dir
-        self._spool_dir = Path(tempfile.mkdtemp(prefix="arcgeneral_spool_"))
-        if self._config.sandbox_image:
-            # Docker mode: bind-mount workspace and spool into container
-            binds = dict(self._config.sandbox_binds)
-            binds[str(self._spool_dir)] = "spool"
-            self._fork_server = ForkServer(
-                tag=self._config.sandbox_image,
-                binds=binds,
-                host_function_server=self._server,
-            )
-            # Resolve paths as they appear inside the container
-            self._config.workspace_path = self._config.workspace_path or "/app/workspace/"
-            self._config.spool_path = self._config.spool_path or "/app/spool"
-        else:
-            # Local mode: fork server runs as a subprocess on the host
-            self._fork_server = LocalForkServer(
-                host_function_server=self._server,
-            )
-            # Resolve paths to real host directories
-            workspace_candidates = list(self._config.sandbox_binds.values())
-            if workspace_candidates:
-                # Use the first bind's host path as workspace
-                workspace_host = list(self._config.sandbox_binds.keys())[0]
-                self._config.workspace_path = self._config.workspace_path or workspace_host
-            else:
-                self._config.workspace_path = self._config.workspace_path or str(Path.cwd())
-            self._config.spool_path = self._config.spool_path or str(self._spool_dir)
-        await self._fork_server.__aenter__()
-
-        # Init API key resolver (default reads from env vars)
-        if self._config.get_api_key is None:
-            self._config.get_api_key = default_api_key_resolver()
-        # Init LLM client (create default if none injected)
-        if self._llm_client is None:
-            self._llm_client = OpenRouterClient()
-
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Close all sessions
-        for session in list(self._sessions.values()):
-            try:
-                await session.close()
-            except Exception:
-                logger.warning("Failed to close session", exc_info=True)
-        self._sessions.clear()
-        self._agent_to_session.clear()
-        self._task_to_session.clear()
-
-        # Stop fork server (kills the container)
-        if self._fork_server is not None:
-            try:
-                await self._fork_server.__aexit__(exc_type, exc_val, exc_tb)
-            except Exception:
-                logger.warning("Failed to stop fork server", exc_info=True)
-            finally:
-                self._fork_server = None
-
-        # Stop host function server
-        if self._server is not None:
-            try:
-                await self._server.__aexit__(exc_type, exc_val, exc_tb)
-            except Exception:
-                logger.warning("Failed to stop HostFunctionServer", exc_info=True)
-            finally:
-                self._server = None
-
-        # Close LLM client (only if we created it)
-        if self._owns_llm_client and self._llm_client is not None:
-            try:
-                await self._llm_client.close()
-            except Exception:
-                logger.warning("Failed to close LLM client", exc_info=True)
-            finally:
-                self._llm_client = None
-
-        # Clean up spool dir
-        if self._spool_dir is not None:
-            try:
-                shutil.rmtree(self._spool_dir, ignore_errors=True)
-            finally:
-                self._spool_dir = None
-
-    # ── Session management ──
-
-    async def create_session(self, session_id: str, *, on_event=None, context_messages: list[dict] | None = None) -> Session:
-        """Create a new independent session with its own sandbox and message history.
-
-        Args:
-            session_id: Caller-provided unique identifier for this session.
-            on_event: Optional callback for session events.
-            context_messages: Optional list of {"role": "user"|"assistant", "content": "..."}
-                messages to prepend as conversation history after the system prompt.
+        The sub-agent's lock serializes concurrent tasks on the same agent.
+        Each task appends a user message and runs a full agent turn, preserving
+        the sub-agent's message history and REPL state across tasks.
         """
-        if session_id in self._sessions:
-            raise ValueError(f"Session {session_id!r} already exists")
-        sandbox = await self._fork_server.create_sandbox()
-        await self._inject_agent_id(sandbox, session_id)
-        messages, request_kwargs = self._init_messages(self._config)
-        if context_messages:
-            messages.extend(context_messages)
-        session = Session(
-            runtime=self,
-            sandbox=sandbox,
-            messages=messages,
-            request_kwargs=request_kwargs,
-            session_id=session_id,
-            on_event=on_event,
-        )
-        self._agent_to_session[session_id] = session
-        self._sessions[session_id] = session
-        return session
+        sub = self._sub_agents.get(agent_id)
+        if sub is None:
+            raise RuntimeError(f"Unknown agent_id: {agent_id}")
+        task_id = uuid.uuid4().hex[:12]
+        logger.info("[session %s] Starting task %s on sub-agent %s: %s",
+                     self._session_id, task_id, agent_id, task[:100])
 
-    def get_session(self, session_id: str) -> Session:
-        """Retrieve an existing session by ID."""
-        session = self._sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"Unknown session: {session_id!r}")
-        return session
-
-    async def close_session(self, session_id: str) -> None:
-        """Close and remove a session by ID. No-op if session doesn't exist."""
-        session = self._sessions.get(session_id)
-        if session is not None:
-            await session.close()
-
-    def _init_messages(self, config: AgentConfig, extra_instructions: str | None = None) -> tuple[list, dict]:
-        """Seed the messages list and build request kwargs."""
-        messages: list = []
-        system_prompt = config.system_prompt if config.system_prompt is not None else DEFAULT_SYSTEM_PROMPT
-        functions_json = self._registry.build_schemas_json()
-        system_prompt = system_prompt.format(
-            functions_json=functions_json,
-            workspace_path=config.workspace_path or "/app/workspace/",
-            spool_path=config.spool_path or "/app/spool",
-        )
-        if extra_instructions:
-            system_prompt += (
-                "\n\n## Your Role\n"
-                "You were created by another agent to accomplish a specific task. "
-                "Your final text response (when you stop calling tools) is returned to your creator as the result. "
-                "Be specific and structured in your output \u2014 it feeds into further work. "
-                "For large results, save to disk and return the file path in your response.\n"
-                "\n## Additional Instructions\n" + extra_instructions
-            )
-        messages.append({"role": "system", "content": system_prompt})
-
-        request_kwargs: dict = {
-            "model": config.model,
-            "tools": [PYTHON_TOOL_SCHEMA],
-        }
-        if config.temperature is not None:
-            request_kwargs["temperature"] = config.temperature
-        return messages, request_kwargs
-
-    async def _inject_agent_id(self, sandbox: Sandbox, agent_id: str) -> None:
-        """Inject _AGENT_ID and rewrap create_agent to pass it automatically for depth tracking."""
-        code = (
-            f"_AGENT_ID = {agent_id!r}\n"
-            "if 'create_agent' in dir():\n"
-            "    _original_create_agent = create_agent\n"
-            "    async def create_agent(instructions):\n"
-            "        return await _original_create_agent(instructions=instructions, _caller_id=_AGENT_ID)\n"
-        )
-        try:
-            await sandbox.execute(code, timeout=10.0)
-        except Exception:
-            logger.debug("Failed to inject agent ID %s", agent_id, exc_info=True)
-
-    async def _sync_history(self, sandbox: Sandbox, messages: list) -> None:
-        """Push the full conversation history into the kernel as _conversation_history."""
-        try:
-            payload = json.dumps(messages, ensure_ascii=False)
-            code = f"import json as _json\n_conversation_history = _json.loads({payload!r})"
-            await sandbox.execute(code, timeout=10.0)
-        except Exception:
-            logger.debug("Failed to sync conversation history to kernel", exc_info=True)
-
-    @staticmethod
-    def _compress_messages(full_history: list) -> list:
-        """Compress previous turns to user+final-assistant only. Current turn kept in full."""
-        # Find the last user message — everything from there is the current turn
-        last_user_idx = None
-        for i in range(len(full_history) - 1, -1, -1):
-            if full_history[i].get("role") == "user":
-                last_user_idx = i
-                break
-
-        if last_user_idx is None:
-            return list(full_history)
-
-        # Previous turns: keep system, user, and final assistant (no tool_calls) only
-        compressed = []
-        for msg in full_history[:last_user_idx]:
-            role = msg.get("role")
-            if role in ("system", "user"):
-                compressed.append(msg)
-            elif role == "assistant" and "tool_calls" not in msg:
-                compressed.append(msg)
-            # Drop: assistant with tool_calls, tool results
-
-        # Current turn: everything from last user message onward
-        compressed.extend(full_history[last_user_idx:])
-        return compressed
-
-    @staticmethod
-    def _emit(on_event, event: AgentEvent) -> None:
-        """Fire an event to the consumer callback, silently ignoring errors."""
-        if on_event is not None:
+        async def _execute():
             try:
-                on_event(event)
-            except Exception:
-                logger.debug("Event callback error", exc_info=True)
+                async with sub.lock:
+                    await self._ensure_sub_sandbox(agent_id, sub)
+                    sub.messages.append({"role": "user", "content": task})
+                    result = await self._run_turn(
+                        sub.messages, sub.sandbox, sub.request_kwargs,
+                        agent_label=agent_id,
+                    )
+                    logger.info("[session %s] Task %s on sub-agent %s finished",
+                                 self._session_id, task_id, agent_id)
+                    return result
+            except asyncio.CancelledError:
+                logger.info("[session %s] Task %s on sub-agent %s cancelled",
+                             self._session_id, task_id, agent_id)
+                raise
 
+        task_obj = asyncio.create_task(_execute())
+        self._running_tasks[task_id] = task_obj
+        return task_id
 
-    async def _llm_call(self, messages: list, request_kwargs: dict):
-        """LLM call with retry on transient errors (4 attempts, exponential backoff)."""
-        max_attempts = 4
-        api_key = await self._config.get_api_key(self._config.provider)
-        for attempt in range(max_attempts):
-            try:
-                return await self._llm_client.complete(
-                    messages=messages,
-                    api_key=api_key,
-                    **request_kwargs,
-                )
-            except Exception as e:
-                if attempt == max_attempts - 1:
-                    raise
-                wait = min(2 ** attempt, 10)
-                logger.warning("LLM call failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_attempts, wait, e)
-                await asyncio.sleep(wait)
-                # Re-resolve key on retry (may have been refreshed)
-                api_key = await self._config.get_api_key(self._config.provider)
+    async def await_sub_task(self, task_id: str) -> str:
+        """Block until a sub-agent task completes and return the result."""
+        task = self._running_tasks.get(task_id)
+        if task is None:
+            raise RuntimeError(f"Unknown task_id: {task_id}")
+        try:
+            return await task
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            self._running_tasks.pop(task_id, None)
 
-    async def _run_turn(self, full_history: list, sandbox: Sandbox, config: AgentConfig, request_kwargs: dict, agent_label: str = "main", on_event=None) -> str:
+    # ── Agent loop ──
+
+    async def _run_turn(self, full_history: list, sandbox: Sandbox,
+                        request_kwargs: dict, agent_label: str = "main") -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop).
+
+        Works for both the root agent and sub-agents — the caller passes the
+        appropriate messages/sandbox/request_kwargs for each.
 
         On CancelledError, rolls back full_history to the start of the
         interrupted round so the message list stays consistent (every
         assistant tool_calls entry has matching tool results).
         """
+        config = self._services.config
+        on_event = self._on_event
         turn_start = time.monotonic()
         total_prompt_tokens = 0
         total_completion_tokens = 0
@@ -499,7 +323,7 @@ class AgentRuntime:
                 self._emit(on_event, RoundStart(agent_id=agent_label, round_num=round_num, max_rounds=config.max_tool_rounds))
                 compressed = self._compress_messages(full_history)
                 self._emit(on_event, ModelRequest(agent_id=agent_label))
-                response = await self._llm_call(compressed, request_kwargs)
+                response = await self._services.llm_call(compressed, request_kwargs)
 
                 choice = response.choices[0]
                 msg = choice.message
@@ -569,7 +393,7 @@ class AgentRuntime:
                         timeout=config.code_timeout,
                         limit_lines=config.output_limit_lines,
                         limit_bytes=config.output_limit_bytes,
-                        host_spool_dir=self._spool_dir,
+                        host_spool_dir=self._services.spool_dir,
                         container_spool_dir=config.spool_path or "/app/spool",
                     )
                     self._emit(on_event, ToolExecEnd(agent_id=agent_label, tool_name=tc.function.name, elapsed_seconds=time.monotonic() - tool_start))
@@ -595,7 +419,343 @@ class AgentRuntime:
         ))
         return full_history[-1].get("content", "") if isinstance(full_history[-1], dict) else ""
 
+    # ── Internal helpers ──
+
+    async def _ensure_sub_sandbox(self, agent_id: str, sub: _SubAgent) -> None:
+        """Lazily create sandbox and init messages on first use."""
+        if sub.sandbox is not None:
+            return
+        logger.info("[session %s] Creating sandbox for sub-agent %s", self._session_id, agent_id)
+        sub.sandbox = await self._services.create_sandbox()
+        await self._inject_agent_id(sub.sandbox, agent_id)
+        sub.messages, sub.request_kwargs = self._services.init_messages(
+            self._services.config,
+            extra_instructions=sub.instructions,
+        )
+        logger.info("[session %s] Sub-agent %s ready", self._session_id, agent_id)
+
+    @staticmethod
+    async def _inject_agent_id(sandbox: Sandbox, agent_id: str) -> None:
+        """Inject _AGENT_ID and rewrap create_agent to pass it automatically for depth tracking."""
+        code = (
+            f"_AGENT_ID = {agent_id!r}\n"
+            "if 'create_agent' in dir():\n"
+            "    _original_create_agent = create_agent\n"
+            "    async def create_agent(instructions):\n"
+            "        return await _original_create_agent(instructions=instructions, _caller_id=_AGENT_ID)\n"
+        )
+        try:
+            await sandbox.execute(code, timeout=10.0)
+        except Exception:
+            logger.debug("Failed to inject agent ID %s", agent_id, exc_info=True)
+
+    @staticmethod
+    async def _sync_history(sandbox: Sandbox, messages: list) -> None:
+        """Push the full conversation history into the kernel as _conversation_history."""
+        try:
+            payload = json.dumps(messages, ensure_ascii=False)
+            code = f"import json as _json\n_conversation_history = _json.loads({payload!r})"
+            await sandbox.execute(code, timeout=10.0)
+        except Exception:
+            logger.debug("Failed to sync conversation history to kernel", exc_info=True)
+
+    @staticmethod
+    def _compress_messages(full_history: list) -> list:
+        """Compress previous turns to user+final-assistant only. Current turn kept in full."""
+        # Find the last user message — everything from there is the current turn
+        last_user_idx = None
+        for i in range(len(full_history) - 1, -1, -1):
+            if full_history[i].get("role") == "user":
+                last_user_idx = i
+                break
+
+        if last_user_idx is None:
+            return list(full_history)
+
+        # Previous turns: keep system, user, and final assistant (no tool_calls) only
+        compressed = []
+        for msg in full_history[:last_user_idx]:
+            role = msg.get("role")
+            if role in ("system", "user"):
+                compressed.append(msg)
+            elif role == "assistant" and "tool_calls" not in msg:
+                compressed.append(msg)
+            # Drop: assistant with tool_calls, tool results
+
+        # Current turn: everything from last user message onward
+        compressed.extend(full_history[last_user_idx:])
+        return compressed
+
+    @staticmethod
+    def _emit(on_event, event: AgentEvent) -> None:
+        """Fire an event to the consumer callback, silently ignoring errors."""
+        if on_event is not None:
+            try:
+                on_event(event)
+            except Exception:
+                logger.debug("Event callback error", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# AgentRuntime — infrastructure lifecycle + host function routing
+# ---------------------------------------------------------------------------
+
+class AgentRuntime:
+    """Owns the infrastructure lifecycle: host function server, fork server, LLM client.
+
+    Creates sessions for independent conversations. Routes host function calls
+    (create_agent, run_agent, await_result) from any agent at any depth to the
+    correct Session via a flat routing table (_agent_to_session).
+    """
+
+    def __init__(self, config: AgentConfig, registry: HostFunctionRegistry, llm_client: LLMClient | None = None):
+        self._config = config
+        self._registry = registry
+        self._server: HostFunctionServer | None = None
+        self._fork_server: ForkServer | None = None
+        self._llm_client = llm_client
+        self._owns_llm_client = llm_client is None
+
+        # Session tracking
+        self._sessions: dict[str, Session] = {}
+
+        # Flat routing tables: every agent_id and task_id at any depth maps
+        # back to the root Session that owns its agent tree.
+        self._agent_to_session: dict[str, Session] = {}
+        self._task_to_session: dict[str, Session] = {}
+
+        # Spool dir for truncated output (temp dir, cleaned up on __aexit__)
+        self._spool_dir: Path | None = None
+
+        # RuntimeServices — built lazily in __aenter__ once infrastructure is up
+        self._services: RuntimeServices | None = None
+
+        # Register runtime host functions into the registry (before server starts,
+        # so they appear in the system prompt and get kernel stubs).
+        registry.register("create_agent", self._host_create_agent)
+        registry.register("run_agent", self._host_run_agent)
+        registry.register(
+            "await_result",
+            self._host_await_result,
+            timeout=max(config.code_timeout - 30, 30),
+        )
+
+    async def __aenter__(self) -> Self:
+        # Start shared host function server
+        if self._registry.names:
+            self._server = HostFunctionServer(self._registry)
+            await self._server.__aenter__()
+
+        # Create temp spool dir
+        self._spool_dir = Path(tempfile.mkdtemp(prefix="arcgeneral_spool_"))
+        if self._config.sandbox_image:
+            # Docker mode: bind-mount workspace and spool into container
+            binds = dict(self._config.sandbox_binds)
+            binds[str(self._spool_dir)] = "spool"
+            self._fork_server = ForkServer(
+                tag=self._config.sandbox_image,
+                binds=binds,
+                host_function_server=self._server,
+            )
+            # Resolve paths as they appear inside the container
+            self._config.workspace_path = self._config.workspace_path or "/app/workspace/"
+            self._config.spool_path = self._config.spool_path or "/app/spool"
+        else:
+            # Local mode: fork server runs as a subprocess on the host
+            self._fork_server = LocalForkServer(
+                host_function_server=self._server,
+            )
+            # Resolve paths to real host directories
+            workspace_candidates = list(self._config.sandbox_binds.values())
+            if workspace_candidates:
+                # Use the first bind's host path as workspace
+                workspace_host = list(self._config.sandbox_binds.keys())[0]
+                self._config.workspace_path = self._config.workspace_path or workspace_host
+            else:
+                self._config.workspace_path = self._config.workspace_path or str(Path.cwd())
+            self._config.spool_path = self._config.spool_path or str(self._spool_dir)
+        await self._fork_server.__aenter__()
+
+        # Init API key resolver (default reads from env vars)
+        if self._config.get_api_key is None:
+            self._config.get_api_key = default_api_key_resolver()
+        # Init LLM client (create default if none injected)
+        if self._llm_client is None:
+            self._llm_client = OpenRouterClient()
+
+        # Build the services bundle that Sessions will use
+        self._services = RuntimeServices(
+            llm_call=lambda msgs, kw: self._llm_call(msgs, kw),
+            create_sandbox=self._fork_server.create_sandbox,
+            init_messages=self._init_messages,
+            config=self._config,
+            spool_dir=self._spool_dir,
+        )
+
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Close all sessions (Runtime drives close to clean up routing tables)
+        for sid, session in list(self._sessions.items()):
+            try:
+                await self._close_session_internal(sid, session)
+            except Exception:
+                logger.warning("Failed to close session", exc_info=True)
+        self._sessions.clear()
+        self._agent_to_session.clear()
+        self._task_to_session.clear()
+
+        # Stop fork server (kills the container)
+        if self._fork_server is not None:
+            try:
+                await self._fork_server.__aexit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                logger.warning("Failed to stop fork server", exc_info=True)
+            finally:
+                self._fork_server = None
+
+        # Stop host function server
+        if self._server is not None:
+            try:
+                await self._server.__aexit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                logger.warning("Failed to stop HostFunctionServer", exc_info=True)
+            finally:
+                self._server = None
+
+        # Close LLM client (only if we created it)
+        if self._owns_llm_client and self._llm_client is not None:
+            try:
+                await self._llm_client.close()
+            except Exception:
+                logger.warning("Failed to close LLM client", exc_info=True)
+            finally:
+                self._llm_client = None
+
+        # Clean up spool dir
+        if self._spool_dir is not None:
+            try:
+                shutil.rmtree(self._spool_dir, ignore_errors=True)
+            finally:
+                self._spool_dir = None
+
+        self._services = None
+
+    # ── Session management ──
+
+    async def create_session(self, session_id: str, *, on_event=None, context_messages: list[dict] | None = None) -> Session:
+        """Create a new independent session with its own sandbox and message history.
+
+        Args:
+            session_id: Caller-provided unique identifier for this session.
+            on_event: Optional callback for session events.
+            context_messages: Optional list of {"role": "user"|"assistant", "content": "..."}
+                messages to prepend as conversation history after the system prompt.
+        """
+        if session_id in self._sessions:
+            raise ValueError(f"Session {session_id!r} already exists")
+        sandbox = await self._fork_server.create_sandbox()
+        messages, request_kwargs = self._init_messages(self._config)
+        if context_messages:
+            messages.extend(context_messages)
+        session = Session(
+            services=self._services,
+            sandbox=sandbox,
+            messages=messages,
+            request_kwargs=request_kwargs,
+            session_id=session_id,
+            on_event=on_event,
+        )
+        await Session._inject_agent_id(sandbox, session_id)
+        self._agent_to_session[session_id] = session
+        self._sessions[session_id] = session
+        return session
+
+    def get_session(self, session_id: str) -> Session:
+        """Retrieve an existing session by ID."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Unknown session: {session_id!r}")
+        return session
+
+    async def close_session(self, session_id: str) -> None:
+        """Close and remove a session by ID. No-op if session doesn't exist.
+
+        Cleans up Runtime's routing tables, then closes the Session's own resources.
+        """
+        session = self._sessions.get(session_id)
+        if session is not None:
+            await self._close_session_internal(session_id, session)
+
+    async def _close_session_internal(self, session_id: str, session: Session) -> None:
+        """Close a session and clean up all routing table entries."""
+        # Clean up task routing entries
+        for task_id in list(session._running_tasks.keys()):
+            self._task_to_session.pop(task_id, None)
+        # Clean up agent routing entries
+        for agent_id in list(session._sub_agents.keys()):
+            self._agent_to_session.pop(agent_id, None)
+        self._agent_to_session.pop(session_id, None)
+        self._sessions.pop(session_id, None)
+        # Now close the session's own resources (tasks, sandboxes)
+        await session.close()
+
+    # ── Infrastructure services ──
+
+    def _init_messages(self, config: AgentConfig, extra_instructions: str | None = None) -> tuple[list, dict]:
+        """Seed the messages list and build request kwargs."""
+        messages: list = []
+        system_prompt = config.system_prompt if config.system_prompt is not None else DEFAULT_SYSTEM_PROMPT
+        functions_json = self._registry.build_schemas_json()
+        system_prompt = system_prompt.format(
+            functions_json=functions_json,
+            workspace_path=config.workspace_path or "/app/workspace/",
+            spool_path=config.spool_path or "/app/spool",
+        )
+        if extra_instructions:
+            system_prompt += (
+                "\n\n## Your Role\n"
+                "You were created by another agent to accomplish a specific task. "
+                "Your final text response (when you stop calling tools) is returned to your creator as the result. "
+                "Be specific and structured in your output \u2014 it feeds into further work. "
+                "For large results, save to disk and return the file path in your response.\n"
+                "\n## Additional Instructions\n" + extra_instructions
+            )
+        messages.append({"role": "system", "content": system_prompt})
+
+        request_kwargs: dict = {
+            "model": config.model,
+            "tools": [PYTHON_TOOL_SCHEMA],
+        }
+        if config.temperature is not None:
+            request_kwargs["temperature"] = config.temperature
+        return messages, request_kwargs
+
+    async def _llm_call(self, messages: list, request_kwargs: dict) -> CompletionResponse:
+        """LLM call with retry on transient errors (4 attempts, exponential backoff)."""
+        max_attempts = 4
+        api_key = await self._config.get_api_key(self._config.provider)
+        for attempt in range(max_attempts):
+            try:
+                return await self._llm_client.complete(
+                    messages=messages,
+                    api_key=api_key,
+                    **request_kwargs,
+                )
+            except Exception as e:
+                if attempt == max_attempts - 1:
+                    raise
+                wait = min(2 ** attempt, 10)
+                logger.warning("LLM call failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_attempts, wait, e)
+                await asyncio.sleep(wait)
+                # Re-resolve key on retry (may have been refreshed)
+                api_key = await self._config.get_api_key(self._config.provider)
+
     # ── Host functions (called from kernel via HTTP bridge) ──
+    #
+    # These are thin routing layers. They look up which Session an agent belongs
+    # to via the flat _agent_to_session table, then delegate to Session methods.
+    # Every agent_id at every depth maps to the root Session that owns its tree.
 
     async def _host_create_agent(self, instructions: str, _caller_id: str = "main") -> str:
         """Create a sub-agent with its own Python environment.
@@ -606,32 +766,13 @@ class AgentRuntime:
         session = self._agent_to_session.get(_caller_id)
         if session is None:
             raise RuntimeError(f"Unknown caller: {_caller_id}")
-        # Look up calling agent's depth
-        caller_sub = session._sub_agents.get(_caller_id)
-        depth = caller_sub.depth if caller_sub else 0
+        depth = session.get_agent_depth(_caller_id)
         if depth >= self._config.max_sub_agent_depth:
             raise RuntimeError(f"Max sub-agent depth ({self._config.max_sub_agent_depth}) exceeded")
         agent_id = uuid.uuid4().hex[:12]
-        logger.info("[runtime] Registered sub-agent %s (caller=%s, depth=%d)", agent_id, _caller_id, depth + 1)
-        session._sub_agents[agent_id] = _SubAgent(
-            instructions=instructions,
-            depth=depth + 1,
-        )
+        session.register_sub_agent(agent_id, instructions, depth + 1)
         self._agent_to_session[agent_id] = session
         return agent_id
-
-    async def _ensure_sandbox(self, agent_id: str, sub: _SubAgent) -> None:
-        """Lazily create sandbox and init messages on first use."""
-        if sub.sandbox is not None:
-            return
-        logger.info("[runtime] Creating sandbox for sub-agent %s", agent_id)
-        sub.sandbox = await self._fork_server.create_sandbox()
-        await self._inject_agent_id(sub.sandbox, agent_id)
-        sub.messages, sub.request_kwargs = self._init_messages(
-            self._config,
-            extra_instructions=sub.instructions,
-        )
-        logger.info("[runtime] Sub-agent %s ready", agent_id)
 
     async def _host_run_agent(self, agent_id: str, task: str) -> str:
         """Start a task on a previously created sub-agent.
@@ -641,26 +782,9 @@ class AgentRuntime:
         session = self._agent_to_session.get(agent_id)
         if session is None:
             raise RuntimeError(f"Unknown agent_id: {agent_id}")
-        sub = session._sub_agents.get(agent_id)
-        if sub is None:
+        if agent_id not in session._sub_agents:
             raise RuntimeError(f"Unknown agent_id: {agent_id}")
-        task_id = uuid.uuid4().hex[:12]
-        logger.info("[runtime] Starting task %s on sub-agent %s: %s", task_id, agent_id, task[:100])
-
-        async def _execute():
-            try:
-                async with sub.lock:
-                    await self._ensure_sandbox(agent_id, sub)
-                    sub.messages.append({"role": "user", "content": task})
-                    result = await self._run_turn(sub.messages, sub.sandbox, self._config, sub.request_kwargs, agent_label=agent_id, on_event=session._on_event)
-                    logger.info("[runtime] Task %s on sub-agent %s finished", task_id, agent_id)
-                    return result
-            except asyncio.CancelledError:
-                logger.info("[runtime] Task %s on sub-agent %s cancelled", task_id, agent_id)
-                raise
-
-        task_obj = asyncio.create_task(_execute())
-        session._running_tasks[task_id] = task_obj
+        task_id = await session.start_sub_task(agent_id, task)
         self._task_to_session[task_id] = session
         return task_id
 
@@ -671,15 +795,9 @@ class AgentRuntime:
         session = self._task_to_session.get(task_id)
         if session is None:
             raise RuntimeError(f"Unknown task_id: {task_id}")
-        task = session._running_tasks.get(task_id)
-        if task is None:
+        if task_id not in session._running_tasks:
             raise RuntimeError(f"Unknown task_id: {task_id}")
         try:
-            return await task
-        except asyncio.CancelledError:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            raise
+            return await session.await_sub_task(task_id)
         finally:
-            session._running_tasks.pop(task_id, None)
             self._task_to_session.pop(task_id, None)
