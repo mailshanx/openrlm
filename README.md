@@ -401,13 +401,21 @@ arcgeneral --functions ./contrib "search for recent papers on transformer effici
 
 ## How It Works
 
-1. **Agent loop.** The LLM reasons, emits a `python` tool call, the harness executes it in the REPL, returns the output, and repeats. When the LLM responds without a tool call, the turn ends.
+1. **Agent loop.** Each call to `run_single()` starts a loop: the LLM reasons, emits a `python` tool call, the Session executes it in the agent's REPL, returns the output to the LLM, and repeats. When the LLM responds without a tool call, the turn ends and the final text is returned.
 
-2. **Message compression.** To manage context length, previous turns are compressed to user message + final assistant response. The current turn retains full tool call history. The complete uncompressed history is also available inside the REPL as `_conversation_history`.
+2. **Message compression.** To manage context length, previous turns are compressed to just the user message and final assistant response. The current turn retains full tool call detail (all intermediate code and output). The complete uncompressed history is also available inside the REPL as `_conversation_history`.
 
-3. **Fork server protocol.** A single persistent TCP connection multiplexes all agent operations (spawn, execute, destroy) by `agent_id`. A separate control channel handles interrupt signals (SIGINT) for timeout/cancellation. Each child process runs code in its main thread so `os.kill(pid, SIGINT)` reliably interrupts even C-level blocking calls. Both local mode and Docker mode use the same protocol.
+3. **Cancellation.** Cancelling a turn (via `asyncio.CancelledError` or the CLI's Ctrl-C) rolls back the message history to the last consistent checkpoint so the Session can be reused cleanly. Sub-agent tasks spawned during the turn are cancelled transitively — the entire agent tree is torn down.
 
-4. **Cancellation.** Ctrl-C during an active turn cancels the turn and rolls back the message history to the last consistent checkpoint. Double Ctrl-C exits the session. Sub-agent tasks are cancelled transitively.
+### CLI-specific behavior
+
+- **Ctrl-C** cancels the active turn and returns to the prompt.
+- **Double Ctrl-C** exits the session.
+- **`--json` mode** wraps the final response in `{"result": ..., "error": ...}` for programmatic consumption.
+
+### Internals
+
+The fork server communicates over a single persistent TCP connection that multiplexes all agent operations (spawn, execute, destroy) by `agent_id`. A separate control channel carries interrupt signals. Each child process runs code in its main thread so `os.kill(pid, SIGINT)` reliably interrupts even C-level blocking calls. Both local mode and Docker mode use the same protocol.
 
 ## LLM Client
 The default client uses [OpenRouter](https://openrouter.ai/), which provides access to models from OpenAI, Anthropic, Google, and others through a single API. It manages a persistent HTTP/2 connection pool internally and cleans it up when the runtime exits.
