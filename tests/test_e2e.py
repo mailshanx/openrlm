@@ -1478,6 +1478,42 @@ async def test_anthropic_non_oauth_system_prompt_unchanged():
     system = captured.get("system")
     report("non_oauth_sys_is_string", isinstance(system, str))
     report("non_oauth_sys_content", system == "You are a data analyst.")
+
+
+async def test_anthropic_oauth_token_env_precedence():
+    """ANTHROPIC_OAUTH_TOKEN takes precedence over ANTHROPIC_API_KEY for anthropic provider."""
+    from arcgeneral.llm import default_api_key_resolver
+
+    resolver = default_api_key_resolver()
+
+    # Both set: ANTHROPIC_OAUTH_TOKEN wins
+    old_oauth = os.environ.get("ANTHROPIC_OAUTH_TOKEN")
+    old_api = os.environ.get("ANTHROPIC_API_KEY")
+    try:
+        os.environ["ANTHROPIC_OAUTH_TOKEN"] = "sk-ant-oat-from-oauth-env"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-api01-from-api-env"
+        key = await resolver("anthropic")
+        report("oauth_token_env_wins", key == "sk-ant-oat-from-oauth-env")
+
+        # Only ANTHROPIC_API_KEY set: falls back
+        del os.environ["ANTHROPIC_OAUTH_TOKEN"]
+        key2 = await resolver("anthropic")
+        report("api_key_env_fallback", key2 == "sk-ant-api01-from-api-env")
+
+        # Non-anthropic provider unaffected
+        os.environ["OPENROUTER_API_KEY"] = "or-test-key"
+        key3 = await resolver("openrouter")
+        report("non_anthropic_unaffected", key3 == "or-test-key")
+    finally:
+        # Restore
+        if old_oauth is not None:
+            os.environ["ANTHROPIC_OAUTH_TOKEN"] = old_oauth
+        elif "ANTHROPIC_OAUTH_TOKEN" in os.environ:
+            del os.environ["ANTHROPIC_OAUTH_TOKEN"]
+        if old_api is not None:
+            os.environ["ANTHROPIC_API_KEY"] = old_api
+        elif "ANTHROPIC_API_KEY" in os.environ:
+            del os.environ["ANTHROPIC_API_KEY"]
 async def test_llm_client_injection():
     """AgentRuntime uses an injected LLMClient instead of creating a default."""
     calls = []
@@ -2062,6 +2098,7 @@ async def main():
     await test_anthropic_regular_key_no_stealth()
     await test_anthropic_oauth_system_prompt_prepend()
     await test_anthropic_non_oauth_system_prompt_unchanged()
+    await test_anthropic_oauth_token_env_precedence()
 
     print("\nShutdown / SIGTERM tests:")
     await test_sigterm_clean_shutdown()

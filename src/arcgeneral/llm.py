@@ -79,7 +79,11 @@ def default_api_key_resolver() -> Callable[[str], Awaitable[str]]:
         if env_var is None:
             # Unknown provider — try PROVIDER_API_KEY convention
             env_var = f"{provider.upper().replace('-', '_')}_API_KEY"
-        key = os.environ.get(env_var, "")
+        # Anthropic: check ANTHROPIC_OAUTH_TOKEN first (matches Pi's precedence)
+        if provider == "anthropic":
+            key = os.environ.get("ANTHROPIC_OAUTH_TOKEN") or os.environ.get(env_var, "")
+        else:
+            key = os.environ.get(env_var, "")
         if not key:
             raise ValueError(
                 f"No API key for provider {provider!r}. "

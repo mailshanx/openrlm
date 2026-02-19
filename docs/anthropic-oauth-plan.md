@@ -77,3 +77,32 @@ OAuth tokens expire. Pi refreshes them with file-locked reads of `~/.pi/agent/au
 1. Accept the failure (simplest).
 2. On 401, re-read `~/.pi/agent/auth.json`, create a new SDK client with the refreshed token, retry.
 3. Implement the full file-lock refresh protocol from Python.
+
+## Implementation Status
+
+All changes implemented and tested.
+
+### Commits
+
+- `6292503` (arcgeneral) — AnthropicClient with OAuth stealth mode + tests (15 assertions)
+- `c7d200b` (arcgeneral) — ANTHROPIC_OAUTH_TOKEN env var precedence (3 assertions)
+- `38bc4d4` (arcgeneral-pi) — Bridge API key from Pi's model registry to subprocess
+
+### Verified against Pi's implementation
+
+| Aspect | Pi's implementation | arcgeneral | Match |
+|--------|-------------------|------------|-------|
+| Token detection | `apiKey.includes("sk-ant-oat")` | `"sk-ant-oat" in api_key` | ✅ |
+| Bearer auth | `apiKey: null, authToken: apiKey` | `api_key=None, auth_token=api_key` | ✅ |
+| `anthropic-beta` | `claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14` | Same | ✅ |
+| `user-agent` | `claude-cli/2.1.2 (external, cli)` | Same | ✅ |
+| `x-app` | `cli` | Same | ✅ |
+| System prompt | Array of content blocks, identity first | Same | ✅ |
+| Identity string | `"You are Claude Code, Anthropic's official CLI for Claude."` | Same | ✅ |
+| Tool renaming | `python` not in CC list, passthrough | No renaming | ✅ |
+| Env var precedence | `ANTHROPIC_OAUTH_TOKEN` > `ANTHROPIC_API_KEY` | Same | ✅ |
+| Token refresh at resolve time | `getApiKeyForProvider()` auto-refreshes | Handled by Pi before bridging | ✅ |
+
+### Known limitation
+
+Token expiry during long runs (>1 hour). Pi's `getApiKeyForProvider()` refreshes the token before handing it to the extension, but the arcgeneral subprocess reuses the SDK client for the full run. A 401 mid-run would require re-reading `~/.pi/agent/auth.json` and reconstructing the client.
