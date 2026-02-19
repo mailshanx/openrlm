@@ -143,11 +143,30 @@ def parse_args() -> argparse.Namespace:
                              '(array of {"role": "user"|"assistant", "content": "..."})')
     parser.add_argument("--json", action="store_true",
                         help="Output result as JSON object")
+    parser.add_argument("--build-image", type=str, nargs="?", const="arcgeneral:sandbox",
+                        default=None, metavar="TAG",
+                        help="Build the Docker sandbox image and exit (default tag: arcgeneral:sandbox)")
+    parser.add_argument("--sandbox-deps", type=str, default=None, metavar="FILE",
+                        help="Dependencies file for --build-image (default: sandbox-deps.txt if it exists)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.build_image:
+        from arcgeneral.ipybox.build import build
+        deps_file = None
+        if args.sandbox_deps:
+            deps_file = Path(args.sandbox_deps)
+            if not deps_file.is_file():
+                raise SystemExit(f"Error: dependencies file not found: {args.sandbox_deps}")
+        else:
+            default_deps = Path("sandbox-deps.txt")
+            if default_deps.is_file():
+                deps_file = default_deps
+        build(args.build_image, deps_file)
+        return
 
     logging.basicConfig(
         level=logging.WARNING,

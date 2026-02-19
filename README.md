@@ -15,96 +15,68 @@ Each agent gets a stateful IPython environment where it can persist variables, d
 - **Cheap sub-agent spawning.** Sub-agents are forked processes. The fork server pre-imports expensive packages (numpy, pandas, etc.), then calls `gc.freeze()` before forking. Children inherit all imported modules via copy-on-write pages, and `gc.freeze()` prevents the garbage collector from scanning those objects — which would dirty the pages and force real memory copies. The OS only allocates memory for new data each sub-agent creates. A single machine can support hundreds to thousands of concurrent sub-agents.
 
 ## Architecture
-arcgeneral has two layers. The **core** gives an LLM a persistent IPython REPL with host function injection and built-in recursive sub-agent spawning (`create_agent`/`run_agent`/`await_result`). The **harness** adds a managed agent loop, message history, and compression on top.
+arcgeneral has two layers: a **core** that handles single-message execution, and a **harness** that adds multi-turn state management on top.
 
-### Core: Fork Server + Sandbox + Host Functions
+### Core: one-shot execution
 
-The core handles execution: you make an LLM call, extract the code from the response, and run it in a sandbox. State persists across `execute()` calls. Host functions you register appear as async callables inside the REPL. Sub-agent functions (`create_agent`, `run_agent`, `await_result`) are built in — code in any sandbox can spawn sub-agents, each with their own isolated REPL, to arbitrary depth. You control the LLM provider, the prompt, and what happens with the output.
+The core takes a single message and runs a complete LLM↔REPL loop: the LLM emits a `python` tool call, the core executes it in a persistent IPython sandbox, returns the output, and repeats until the LLM responds with text. Everything — computation, file I/O, web requests, sub-agent orchestration — is Python code the LLM writes and runs through that single tool. Host functions you register appear as plain `await fn(...)` calls inside the sandbox. Sub-agent functions (`create_agent`, `run_agent`, `await_result`) work the same way — the LLM doesn’t know these are remote calls.
+
+`AgentRuntime` owns the infrastructure: the fork server (process lifecycle), the host function server (HTTP bridge for custom tools), the LLM client (pluggable — default is OpenRouter), and sub-agent routing. It routes sub-agent calls through flat lookup tables so agents at any nesting depth resolve to the correct session.
 
 ```python
-from arcgeneral import LocalForkServer, HostFunctionRegistry
+import asyncio
+from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
 
-registry = HostFunctionRegistry()
-# optionally register host functions on the registry
+async def main():
+    config = AgentConfig(model="openai/gpt-5.2", provider="openrouter")
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry)
 
-async with LocalForkServer(registry) as server:
-    sandbox = await server.create_sandbox()
+    async with runtime:
+        session = await runtime.create_session("my-session")
+        # One message in, one result out. The core handles the full LLM loop.
+        result = await session.run_single("Compute the first 20 prime numbers")
+        print(result)
+        await runtime.close_session("my-session")
 
-    # You make your own LLM call, get code back, execute it
-    code = await my_llm_call("compute the mean of [1, 2, 3] using numpy")
-    output = await sandbox.execute(code, timeout=30)
-    print(output)  # "2.0"
-
-    # Sandbox persists state — variables survive across execute() calls
-    output = await sandbox.execute("print(x + 1)", timeout=30)  # x was set by prior code
-
-    await sandbox.close()
+asyncio.run(main())
 ```
 
-The fork server pre-imports expensive packages once, calls `gc.freeze()`, then forks a child process for each sandbox. Children share pre-imported module memory via OS-level copy-on-write. Host functions registered on the caller side are injected as async stubs into each sandbox's REPL — the code inside calls `await my_function(...)` and it transparently round-trips to the host via HTTP.
+The fork server pre-imports expensive packages once, calls `gc.freeze()`, then forks a child process for each sandbox. Children share pre-imported module memory via OS-level copy-on-write. Host functions registered on the caller side are injected as async stubs into each sandbox — the code inside calls `await my_function(...)` and it transparently round-trips to the host via HTTP.
 
-Both local mode (subprocess, the default) and Docker mode (container, for isolation) use the same TCP-based protocol. The LLM provider is entirely your choice at this layer.
+**Two execution modes** (both use the same TCP-based protocol):
 
-To build your own harness on the core, you would:
-1. Create a `HostFunctionRegistry` and register any domain-specific functions
-2. Start a `LocalForkServer` (or `ForkServer` for Docker) with the registry
-3. Call `server.create_sandbox()` to get a `Sandbox` for each agent
-4. Make your own LLM calls, extract code, run it via `sandbox.execute(code, timeout)`
-
-Sub-agent spawning works automatically — code in the sandbox can call `create_agent`/`run_agent`/`await_result` and the core handles routing and sandbox creation. What you're replacing is the LLM loop and message management, not the execution infrastructure.
-
-### Harness: Session + AgentRuntime
-
-The harness wraps the core with LLM-driven automation:
-
-```
-+----------------------------------------------------------+
-|  AgentRuntime                                            |
-|                                                          |
-|  +------------+  +------------------+                    |
-|  | LLM Client |  | Host Function    |                    |
-|  | (OpenRouter |  | Server           |                    |
-|  |  or custom) |  | (HTTP bridge)    |                    |
-|  +------------+  +--------+---------+                    |
-|                           |                              |
-|  +------------------------|-----------------------+      |
-|  | Session                |                       |      |
-|  |                        |                       |      |
-|  |  +--------------+      |                       |      |
-|  |  | Agent Loop   |      |                       |      |
-|  |  | (LLM <> REPL)|      |                       |      |
-|  |  +------+-------+      |                       |      |
-|  |         |              |                       |      |
-|  |         v              |                       |      |
-|  |  +---------------+     |                       |      |
-|  |  | Sandbox       |<----+                       |      |
-|  |  | (IPython REPL)|  host function stubs        |      |
-|  |  +------+--------+                             |      |
-|  |         | create_agent / run_agent              |      |
-|  |         v                                      |      |
-|  |  +-------------+  +-------------+              |      |
-|  |  | Sub-agent   |  | Sub-agent   |  ...         |      |
-|  |  | (own REPL)  |  | (own REPL)  |              |      |
-|  |  +-------------+  +-------------+              |      |
-|  +------------------------------------------------+      |
-|                                                          |
-|  +----------------------------------------------------+  |
-|  | Fork Server                                        |  |
-|  | (local subprocess or Docker container)             |  |
-|  +----------------------------------------------------+  |
-+----------------------------------------------------------+
-```
-
-**AgentRuntime** manages shared infrastructure: the LLM client, the host function server, the fork server, and output spooling. It creates Sessions and routes sub-agent operations from any depth in the agent tree to the correct Session.
-
-**Session** owns a single conversation: the agent loop (LLM calls + tool execution), message history, the root sandbox, and the full sub-agent tree. You call `session.run_single("message")` to run a turn. For multi-turn use, call it repeatedly — messages and REPL state accumulate across turns. Each Session is independent; multiple Sessions can run concurrently on the same Runtime.
-
-If you need full control over message construction, LLM calls, or tool dispatch, use the core layer directly and build your own harness (see the core section above).
-
-**Two execution modes:**
-
-- **Local (default):** Fork server runs as a subprocess on the host machine. No Docker required. The workspace directory defaults to your current working directory — files agents create there appear on your filesystem.
+- **Local (default):** Fork server runs as a subprocess. No Docker required. The workspace directory defaults to cwd — files agents create appear on your filesystem.
 - **Docker:** Fork server runs inside a container for isolation. Host directories are exposed via bind mounts. Use `--image` to enable.
+
+### Harness: multi-turn state management
+
+For multi-turn conversations, call `run_single()` repeatedly on the same session. The harness manages what accumulates between turns:
+
+- **Message history.** Each `run_single()` appends the user message and final assistant response. REPL state (variables, imports, computed results) also persists.
+- **Message compression.** Previous turns are compressed to just user message + final assistant response. The current turn retains full tool call detail. The complete uncompressed history is available inside the REPL as `_conversation_history`.
+- **Cancellation.** Cancelling a turn (via `asyncio.CancelledError` or Ctrl-C) rolls back message history to the last consistent checkpoint. Sub-agent tasks are cancelled transitively.
+
+```python
+async with runtime:
+    session = await runtime.create_session("analysis")
+    # Turn 1: agent loads data, stores DataFrame in a REPL variable
+    response = await session.run_single("Load data.csv and show me the column names")
+    print(response)  # "The file has columns: date, product, price, volume ..."
+
+    # Turn 2: agent reuses the loaded DataFrame — no re-reading needed
+    response = await session.run_single("What's the correlation between price and volume?")
+    print(response)  # "The Pearson correlation is 0.73 ..."
+
+    # Turn 3: agent builds on all prior computed state
+    response = await session.run_single("Plot the top 5 outliers and save to outliers.png")
+    print(response)  # "Saved outliers.png with 5 data points highlighted ..."
+    await runtime.close_session("analysis")
+```
+
+The caller provides user messages and consumes response strings. Everything else — message accumulation, compression, tool execution, history sync — happens inside the Session. Each Session is independent; multiple Sessions can run concurrently on the same Runtime.
+
+**Building your own harness.** If you need different message management — custom compression, external history storage, your own context window strategy — use `AgentRuntime` and call `session.run_single()` for one-shot execution, but manage conversation state yourself between calls. What you’re replacing is the multi-turn accumulation logic, not the LLM loop or execution infrastructure.
 
 ## Installation
 
@@ -121,11 +93,18 @@ pip install arcgeneral[contrib]
 ```
 
 To use Docker mode, build the sandbox image:
+```bash
+arcgeneral --build-image
+```
 
-```python
-from arcgeneral.ipybox.build import build
-from pathlib import Path
-build("arcgeneral:sandbox", Path("sandbox-deps.txt"))
+This builds `arcgeneral:sandbox` using `sandbox-deps.txt` if present in the current directory. To customize:
+
+```bash
+# Custom tag
+arcgeneral --build-image my-image:latest
+
+# Custom dependencies file
+arcgeneral --build-image --sandbox-deps my-deps.txt
 ```
 
 ## Quickstart
@@ -159,53 +138,10 @@ arcgeneral --context history.json "continue the analysis"
 ```
 
 ### Library
-
-#### Single-shot
-
-```python
-import asyncio
-from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
-
-async def main():
-    config = AgentConfig(
-        model="openai/gpt-5.2",
-        provider="openrouter",
-    )
-    registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
-
-    async with runtime:
-        session = await runtime.create_session("my-session")
-        result = await session.run_single("What is 2 + 2?")
-        print(result)
-        await runtime.close_session("my-session")
-
-asyncio.run(main())
-```
-
-#### Multi-turn
-Call `run_single()` repeatedly on the same session. The Session manages the full conversation history internally — you don't construct or pass messages. Each call appends a user message, runs the agent loop (which may involve multiple LLM/tool-call rounds), and returns the final assistant response as a string. REPL state (variables, imports, computed results) also persists across turns.
-```python
-async with runtime:
-    session = await runtime.create_session("analysis")
-    # Turn 1: agent loads data, stores DataFrame in a REPL variable
-    response = await session.run_single("Load data.csv and show me the column names")
-    print(response)  # "The file has columns: date, product, price, volume ..."
-
-    # Turn 2: agent reuses the loaded DataFrame — no re-reading needed
-    response = await session.run_single("What's the correlation between price and volume?")
-    print(response)  # "The Pearson correlation is 0.73 ..."
-
-    # Turn 3: agent builds on all prior computed state
-    response = await session.run_single("Plot the top 5 outliers and save to outliers.png")
-    print(response)  # "Saved outliers.png with 5 data points highlighted ..."
-    await runtime.close_session("analysis")
-```
-
-The caller's only job is to provide the user message and consume the response string. Everything else — message accumulation, compression of older turns, tool call execution, history synchronization to the REPL — happens inside the Session.
+See the [Architecture](#architecture) section for single-shot and multi-turn library usage examples.
 
 ### Custom Host Functions
-Define tools that execute on the host but appear as native async functions inside the agent's REPL.
+Define tools that execute on the host but appear as regular async functions inside the agent's REPL.
 
 #### Library usage
 
@@ -217,7 +153,7 @@ from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
 
 async def my_database_query(sql: str, limit: int = 100) -> str:
     """Execute a SQL query against the application database.
-
+    Use this function to make DB queries, like result = await my_database_query(sql="SELECT * FROM users", limit=10)
     Returns results as a JSON string."""
     results = await db.execute(sql, limit=limit)
     return json.dumps(results)
@@ -395,6 +331,8 @@ options:
   --verbose               Enable debug logging
   --env-file PATH         Path to .env file (default: .env)
   --log-file PATH         Log file path (default: ~/Downloads/arcgeneral.log)
+  --build-image [TAG]   Build Docker sandbox image and exit (default: arcgeneral:sandbox)
+  --sandbox-deps FILE   Dependencies file for --build-image (default: sandbox-deps.txt)
 ```
 
 #### `--context FILE`
@@ -424,6 +362,11 @@ Wraps the result in a JSON object for programmatic consumption. Only valid with 
 
 Exactly one of `result` or `error` is non-null.
 
+#### Interactive mode
+
+- **Ctrl-C** cancels the active turn and returns to the prompt.
+- **Double Ctrl-C** exits the session.
+
 ## Bundled Tools
 
 The `contrib/` directory includes two pre-built host functions that use the [Parallel API](https://www.parallel.ai/):
@@ -436,19 +379,6 @@ Both require `PARALLEL_API_KEY` in the environment and the `contrib` extra (`pip
 ```bash
 arcgeneral --functions ./contrib "search for recent papers on transformer efficiency"
 ```
-
-## How It Works
-The **core** gives an LLM a persistent IPython sandbox with host function injection and built-in sub-agent spawning. You make your own LLM calls, extract code from the response, and run it via `sandbox.execute(code, timeout)`. Code can spawn sub-agents to arbitrary depth. State persists across calls. You control the LLM provider and message format.
-
-The **harness** (`Session` + `AgentRuntime`) adds a managed agent mode on top. A call to `run_single("message")` drives the LLM loop: the LLM emits a `python` tool call, the harness executes it in the REPL, returns the output, and repeats until the LLM responds with text. Everything — web requests, file I/O, data analysis, sub-agent orchestration — is code the LLM writes and runs through that single tool. The harness also handles:
-- **Message compression.** Previous turns are compressed to just the user message and final assistant response. The current turn retains full tool call detail. The complete uncompressed history is available inside the REPL as `_conversation_history`.
-- **Cancellation.** Cancelling a turn (via `asyncio.CancelledError` or the CLI's Ctrl-C) rolls back the message history to the last consistent checkpoint. Sub-agent tasks are cancelled transitively.
-
-### CLI-specific behavior
-
-- **Ctrl-C** cancels the active turn and returns to the prompt.
-- **Double Ctrl-C** exits the session.
-- **`--json` mode** wraps the final response in `{"result": ..., "error": ...}` for programmatic consumption.
 
 ## LLM Client
 The default client uses [OpenRouter](https://openrouter.ai/), which provides access to models from OpenAI, Anthropic, Google, and others through a single API. It manages a persistent HTTP/2 connection pool internally and cleans it up when the runtime exits.
@@ -519,7 +449,7 @@ uv sync
 uv run python tests/test_e2e.py
 
 # Build sandbox image (for Docker mode tests)
-python -c "from arcgeneral.ipybox.build import build; from pathlib import Path; build('arcgeneral:sandbox', Path('sandbox-deps.txt'))"
+arcgeneral --build-image
 ```
 
 ## License
