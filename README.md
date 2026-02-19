@@ -167,38 +167,74 @@ async with runtime:
 The caller's only job is to provide the user message and consume the response string. Everything else — message accumulation, compression of older turns, tool call execution, history synchronization to the REPL — happens inside the Session.
 
 ### Custom Host Functions
+Define tools that execute on the host but appear as native async functions inside the agent's REPL.
 
-Define tools that execute on the host but appear as native async functions inside the agent's REPL:
+#### Library usage
+
+When using arcgeneral as a library, you create a `HostFunctionRegistry`, register functions on it, and pass it to `AgentRuntime`:
 
 ```python
-from arcgeneral import HostFunctionRegistry
+import json
+from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
 
 async def my_database_query(sql: str, limit: int = 100) -> str:
     """Execute a SQL query against the application database.
 
     Returns results as a JSON string."""
-    # Your implementation here
     results = await db.execute(sql, limit=limit)
     return json.dumps(results)
 
 registry = HostFunctionRegistry()
 registry.register("my_database_query", my_database_query)
+
+# The registry is passed to the runtime, which injects the functions into every agent's REPL
+runtime = AgentRuntime(AgentConfig(), registry)
 ```
 
-Inside the agent's REPL, this becomes callable as:
+Inside the agent's REPL, the function becomes callable as:
 
 ```python
 result = await my_database_query(sql="SELECT * FROM users", limit=10)
 ```
 
-The function's type hints and docstring are used automatically — Pydantic builds a JSON schema from the signature for the system prompt, and the docstring becomes the function description the LLM sees.
+The function's type hints and docstring are picked up automatically — Pydantic builds a JSON schema from the signature for the system prompt, and the docstring becomes the description the LLM sees. No separate schema definitions needed.
 
-For file-based registration (used with `--functions`), export a `register` function:
+#### CLI usage (`--functions`)
+
+When using the CLI, you don't create a registry yourself — the CLI creates one and needs a way to discover your functions. You provide a Python file (or directory of files) that exports a `register(registry)` function. The CLI calls it, passing its own `HostFunctionRegistry` instance:
 
 ```python
 # my_tools.py
+import json
+
+async def my_database_query(sql: str, limit: int = 100) -> str:
+    """Execute a SQL query against the application database.
+
+    Returns results as a JSON string."""
+    results = await db.execute(sql, limit=limit)
+    return json.dumps(results)
+
 def register(registry):
+    """Called by the CLI with its HostFunctionRegistry. Register your functions here."""
     registry.register("my_database_query", my_database_query)
+```
+
+Then:
+
+```bash
+arcgeneral --functions my_tools.py "show me the top 10 users"
+```
+
+For a directory of tool files, each `.py` file with a `register()` function is loaded automatically (files starting with `_` are skipped):
+
+```bash
+arcgeneral --functions ./my-tools/ "analyze the data"
+```
+
+You can also use a dotted module name for installed packages:
+
+```bash
+arcgeneral --functions my_package.tools "do something"
 ```
 
 ### Event Streaming
