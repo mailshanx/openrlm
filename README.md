@@ -15,11 +15,11 @@ Each agent gets a stateful IPython environment where it can persist variables, d
 - **Cheap sub-agent spawning.** Sub-agents are forked processes. The fork server pre-imports expensive packages (numpy, pandas, etc.), then calls `gc.freeze()` before forking. Children inherit all imported modules via copy-on-write pages, and `gc.freeze()` prevents the garbage collector from scanning those objects — which would dirty the pages and force real memory copies. The OS only allocates memory for new data each sub-agent creates. A single machine can support hundreds to thousands of concurrent sub-agents.
 
 ## Architecture
-arcgeneral has two layers. The **core** gives an LLM a persistent IPython REPL with host function injection and recursive sub-agent spawning — the LLM generates code, the code runs in a sandbox, and that code can itself spawn sub-agents each with their own isolated REPL. The **harness** adds managed multi-turn agent loops, message history, and compression on top.
+arcgeneral has two layers. The **core** gives an LLM a persistent IPython REPL with host function injection. The **harness** adds a managed agent loop, message history, compression, and recursive sub-agent orchestration on top — including the `create_agent`/`run_agent`/`await_result` functions that enable sub-agent spawning.
 
 ### Core: Fork Server + Sandbox + Host Functions
 
-The core handles execution: you make an LLM call, extract the code from the response, and run it in a sandbox. The code can spawn sub-agents (`create_agent` / `run_agent` / `await_result`), each getting their own isolated REPL — and those sub-agents can spawn further sub-agents to arbitrary depth. You control the LLM provider, the prompt, and what happens with the output.
+The core handles execution: you make an LLM call, extract the code from the response, and run it in a sandbox. State persists across `execute()` calls. Host functions you register appear as async callables inside the REPL. You control the LLM provider, the prompt, and what happens with the output.
 
 ```python
 from arcgeneral import LocalForkServer, HostFunctionRegistry
@@ -44,6 +44,13 @@ async with LocalForkServer(registry) as server:
 The fork server pre-imports expensive packages once, calls `gc.freeze()`, then forks a child process for each sandbox. Children share pre-imported module memory via OS-level copy-on-write. Host functions registered on the caller side are injected as async stubs into each sandbox's REPL — the code inside calls `await my_function(...)` and it transparently round-trips to the host via HTTP.
 
 Both local mode (subprocess, the default) and Docker mode (container, for isolation) use the same TCP-based protocol. The LLM provider is entirely your choice at this layer.
+
+To build your own harness on the core, you would:
+1. Create a `HostFunctionRegistry` and register any domain-specific functions
+2. Start a `LocalForkServer` (or `ForkServer` for Docker) with the registry
+3. Call `server.create_sandbox()` to get a `Sandbox` for each agent
+4. Make your own LLM calls, extract code, run it via `sandbox.execute(code, timeout)`
+5. To support sub-agents, register your own `create_agent`/`run_agent`/`await_result` host functions that create additional sandboxes and route tasks between them — this is what `AgentRuntime` does internally
 
 ### Harness: Session + AgentRuntime
 
@@ -91,7 +98,7 @@ The harness wraps the core with LLM-driven automation:
 
 **Session** owns a single conversation: the agent loop (LLM calls + tool execution), message history, the root sandbox, and the full sub-agent tree. You call `session.run_single("message")` to run a turn. For multi-turn use, call it repeatedly — messages and REPL state accumulate across turns. Each Session is independent; multiple Sessions can run concurrently on the same Runtime.
 
-If you need full control over message construction, LLM calls, or tool dispatch, use the core layer directly and build your own loop.
+If you need full control over message construction, LLM calls, or tool dispatch, use the core layer directly and build your own harness (see the core section above).
 
 **Two execution modes:**
 
@@ -430,9 +437,9 @@ arcgeneral --functions ./contrib "search for recent papers on transformer effici
 ```
 
 ## How It Works
-The **core** gives an LLM a persistent IPython sandbox with host function injection and recursive sub-agent spawning. You make your own LLM calls, extract code from the response, and run it via `sandbox.execute(code, timeout)`. The code can spawn sub-agents, each with their own REPL, to arbitrary depth. State persists across calls. You control the LLM provider and message format.
+The **core** gives an LLM a persistent IPython sandbox with host function injection. You make your own LLM calls, extract code from the response, and run it via `sandbox.execute(code, timeout)`. State persists across calls. You control the LLM provider and message format.
 
-The **harness** (`Session` + `AgentRuntime`) adds a managed agent mode on top. A call to `run_single("message")` gives the LLM a single tool — `python` — and loops: the LLM emits code, the harness executes it in the REPL, returns the output, and repeats until the LLM responds with text. Everything — web requests, file I/O, data analysis, sub-agent orchestration — is code the LLM writes and runs through that single tool. The harness also handles:
+The **harness** (`Session` + `AgentRuntime`) adds a managed agent mode on top. It registers `create_agent`/`run_agent`/`await_result` as host functions to enable recursive sub-agent spawning, and drives the LLM loop: the LLM emits a `python` tool call, the harness executes it in the REPL, returns the output, and repeats until the LLM responds with text. Everything — web requests, file I/O, data analysis, sub-agent orchestration — is code the LLM writes and runs through that single tool. The harness also handles:
 - **Message compression.** Previous turns are compressed to just the user message and final assistant response. The current turn retains full tool call detail. The complete uncompressed history is available inside the REPL as `_conversation_history`.
 - **Cancellation.** Cancelling a turn (via `asyncio.CancelledError` or the CLI's Ctrl-C) rolls back the message history to the last consistent checkpoint. Sub-agent tasks are cancelled transitively.
 
