@@ -15,6 +15,37 @@ Each agent gets a stateful IPython environment where it can persist variables, d
 - **Cheap sub-agent spawning.** Sub-agents are forked processes. The fork server pre-imports expensive packages (numpy, pandas, etc.), then calls `gc.freeze()` before forking. Children inherit all imported modules via copy-on-write pages, and `gc.freeze()` prevents the garbage collector from scanning those objects — which would dirty the pages and force real memory copies. The OS only allocates memory for new data each sub-agent creates. A single machine can support hundreds to thousands of concurrent sub-agents.
 
 ## Architecture
+arcgeneral has two layers. The **core** is a persistent IPython REPL execution environment with host function injection. The **harness** adds LLM-driven agent loops, message management, and sub-agent orchestration on top.
+
+### Core: Fork Server + Sandbox + Host Functions
+
+The core is usable directly, without any LLM:
+
+```python
+from arcgeneral import LocalForkServer, HostFunctionRegistry
+
+registry = HostFunctionRegistry()
+
+# optionally register host functions on the registry
+
+async with LocalForkServer(registry) as server:
+    sandbox = await server.create_sandbox()
+    output = await sandbox.execute("import numpy as np; print(np.mean([1,2,3]))", timeout=30)
+    print(output)  # "2.0"
+    # sandbox persists state — variables survive across execute() calls
+    await sandbox.execute("x = 42", timeout=30)
+    output = await sandbox.execute("print(x + 1)", timeout=30)
+    print(output)  # "43"
+    await sandbox.close()
+```
+
+The fork server pre-imports expensive packages once, calls `gc.freeze()`, then forks a child process for each sandbox. Children share pre-imported module memory via OS-level copy-on-write. Host functions registered on the caller side are injected as async stubs into each sandbox's REPL — the code inside calls `await my_function(...)` and it transparently round-trips to the host via HTTP.
+
+Both local mode (subprocess, the default) and Docker mode (container, for isolation) use the same TCP-based protocol.
+
+### Harness: Session + AgentRuntime
+
+The harness wraps the core with LLM-driven automation:
 
 ```
 +----------------------------------------------------------+
@@ -50,8 +81,6 @@ Each agent gets a stateful IPython environment where it can persist variables, d
 |  +----------------------------------------------------+  |
 |  | Fork Server                                        |  |
 |  | (local subprocess or Docker container)             |  |
-|  | Pre-imports numpy, pandas, requests                |  |
-|  | gc.freeze() -> os.fork() per agent                 |  |
 |  +----------------------------------------------------+  |
 +----------------------------------------------------------+
 ```
@@ -60,11 +89,10 @@ Each agent gets a stateful IPython environment where it can persist variables, d
 
 **Session** owns a single conversation: the agent loop (LLM calls + tool execution), message history, the root sandbox, and the full sub-agent tree. You call `session.run_single("message")` to run a turn. For multi-turn use, call it repeatedly — messages and REPL state accumulate across turns. Each Session is independent; multiple Sessions can run concurrently on the same Runtime.
 
-**Fork server.** A supervisor process imports expensive packages once, then forks a child process for each agent. Each child gets a fresh namespace but shares the pre-imported module memory via OS-level copy-on-write. Both local mode (subprocess) and Docker mode (container) use the same TCP-based fork server protocol.
-
-**Host function bridge.** Custom functions registered on the host are injected as async stubs into each agent's REPL. When the agent calls a stub, it transparently makes an HTTP POST to the host, which executes the real function and returns the result. The LLM sees a plain `await my_function(...)` call.
+If you need full control over message construction, LLM calls, or tool dispatch, use the core layer directly and build your own loop.
 
 **Two execution modes:**
+
 - **Local (default):** Fork server runs as a subprocess on the host machine. No Docker required. The workspace directory defaults to your current working directory — files agents create there appear on your filesystem.
 - **Docker:** Fork server runs inside a container for isolation. Host directories are exposed via bind mounts. Use `--image` to enable.
 
@@ -400,16 +428,11 @@ arcgeneral --functions ./contrib "search for recent papers on transformer effici
 ```
 
 ## How It Works
-A call to `run_single("message")` spawns a main agent with a persistent IPython REPL and a single tool: `python`. The agent can execute arbitrary code in its REPL, and that code can programmatically spawn sub-agents — each with their own isolated REPL — to arbitrary depth. Every agent in the tree persists data in its REPL across code executions within a turn, and sub-agents persist across multiple tasks.
+The **core** provides persistent IPython sandboxes with host function injection. You call `sandbox.execute(code, timeout)` and get output back. State persists across calls. Host functions appear as native async callables inside the sandbox. This layer has no opinions about LLMs or message formats.
 
-The agent has one tool. Everything else — web requests, file I/O, data analysis, sub-agent orchestration — is code the LLM writes and executes through that tool. Host functions registered on the caller side appear as plain async functions inside the REPL, but they're the only extension point; there's no tool dispatch layer.
-
-### Implementation details
-
-- **Turn execution.** The LLM emits a `python` tool call, the harness executes it in the REPL, returns stdout/stderr to the LLM, and repeats until the LLM responds without a tool call.
+The **harness** (`Session` + `AgentRuntime`) adds a managed agent mode on top. A call to `run_single("message")` gives the LLM a single tool — `python` — and loops: the LLM emits code, the harness executes it in the REPL, returns the output, and repeats until the LLM responds with text. The LLM's code can spawn sub-agents (`create_agent` / `run_agent` / `await_result`), each with their own isolated REPL. Everything — web requests, file I/O, data analysis, sub-agent orchestration — is code the LLM writes and runs through that single tool. The harness also handles:
 - **Message compression.** Previous turns are compressed to just the user message and final assistant response. The current turn retains full tool call detail. The complete uncompressed history is available inside the REPL as `_conversation_history`.
 - **Cancellation.** Cancelling a turn (via `asyncio.CancelledError` or the CLI's Ctrl-C) rolls back the message history to the last consistent checkpoint. Sub-agent tasks are cancelled transitively.
-- **Fork server.** A single persistent TCP connection multiplexes all agent operations (spawn, execute, destroy) by `agent_id`. Each child process runs code in its main thread so interrupt signals reliably stop even C-level blocking calls. Both local mode and Docker mode use the same protocol.
 
 ### CLI-specific behavior
 
