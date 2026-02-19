@@ -400,22 +400,22 @@ arcgeneral --functions ./contrib "search for recent papers on transformer effici
 ```
 
 ## How It Works
+A call to `run_single("message")` spawns a main agent with a persistent IPython REPL and a single tool: `python`. The agent can execute arbitrary code in its REPL, and that code can programmatically spawn sub-agents — each with their own isolated REPL — to arbitrary depth. Every agent in the tree persists data in its REPL across code executions within a turn, and sub-agents persist across multiple tasks.
 
-1. **Agent loop.** Each call to `run_single()` starts a loop: the LLM reasons, emits a `python` tool call, the Session executes it in the agent's REPL, returns the output to the LLM, and repeats. When the LLM responds without a tool call, the turn ends and the final text is returned.
+The agent has one tool. Everything else — web requests, file I/O, data analysis, sub-agent orchestration — is code the LLM writes and executes through that tool. Host functions registered on the caller side appear as plain async functions inside the REPL, but they're the only extension point; there's no tool dispatch layer.
 
-2. **Message compression.** To manage context length, previous turns are compressed to just the user message and final assistant response. The current turn retains full tool call detail (all intermediate code and output). The complete uncompressed history is also available inside the REPL as `_conversation_history`.
+### Implementation details
 
-3. **Cancellation.** Cancelling a turn (via `asyncio.CancelledError` or the CLI's Ctrl-C) rolls back the message history to the last consistent checkpoint so the Session can be reused cleanly. Sub-agent tasks spawned during the turn are cancelled transitively — the entire agent tree is torn down.
+- **Turn execution.** The LLM emits a `python` tool call, the harness executes it in the REPL, returns stdout/stderr to the LLM, and repeats until the LLM responds without a tool call.
+- **Message compression.** Previous turns are compressed to just the user message and final assistant response. The current turn retains full tool call detail. The complete uncompressed history is available inside the REPL as `_conversation_history`.
+- **Cancellation.** Cancelling a turn (via `asyncio.CancelledError` or the CLI's Ctrl-C) rolls back the message history to the last consistent checkpoint. Sub-agent tasks are cancelled transitively.
+- **Fork server.** A single persistent TCP connection multiplexes all agent operations (spawn, execute, destroy) by `agent_id`. Each child process runs code in its main thread so interrupt signals reliably stop even C-level blocking calls. Both local mode and Docker mode use the same protocol.
 
 ### CLI-specific behavior
 
 - **Ctrl-C** cancels the active turn and returns to the prompt.
 - **Double Ctrl-C** exits the session.
 - **`--json` mode** wraps the final response in `{"result": ..., "error": ...}` for programmatic consumption.
-
-### Internals
-
-The fork server communicates over a single persistent TCP connection that multiplexes all agent operations (spawn, execute, destroy) by `agent_id`. A separate control channel carries interrupt signals. Each child process runs code in its main thread so `os.kill(pid, SIGINT)` reliably interrupts even C-level blocking calls. Both local mode and Docker mode use the same protocol.
 
 ## LLM Client
 The default client uses [OpenRouter](https://openrouter.ai/), which provides access to models from OpenAI, Anthropic, Google, and others through a single API. It manages a persistent HTTP/2 connection pool internally and cleans it up when the runtime exits.
