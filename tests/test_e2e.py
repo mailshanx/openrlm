@@ -1031,6 +1031,7 @@ async def test_anthropic_client_converts_text_response():
         async def close(self): pass
 
     client._client = _MockClient()
+    client._current_key = "test-key"
     result = await client.complete(
         messages=[{"role": "system", "content": "You are helpful."}, {"role": "user", "content": "hi"}],
         api_key="test-key",
@@ -1088,6 +1089,7 @@ async def test_anthropic_client_converts_tool_response():
         async def close(self): pass
 
     client._client = _MockClient()
+    client._current_key = "test-key"
     result = await client.complete(messages=[{"role": "user", "content": "hi"}], api_key="test-key", model="test")
     # Verify response translation
     report("anthropic_tool_has_content", result.choices[0].message.content == "Let me compute that.")
@@ -1135,6 +1137,7 @@ async def test_anthropic_translate_full_turn():
 
     client = AnthropicClient()
     client._client = _MockSDK()
+    client._current_key = "test-key"
 
     config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic", sandbox_image=None)
     runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=client)
@@ -1230,6 +1233,7 @@ async def test_anthropic_translate_multi_turn_compressed():
 
     client = AnthropicClient()
     client._client = _MockSDK()
+    client._current_key = "test-key"
 
     # Manually build a compressed history with consecutive user messages
     # (simulating what _compress_messages could produce)
@@ -1383,6 +1387,7 @@ async def test_anthropic_regular_key_no_stealth():
         async def close(self): pass
 
     client._client = _MockSDK()
+    client._current_key = "sk-ant-api01-regular-key"
     client._is_oauth = False  # simulate non-OAuth init
 
     await client.complete(
@@ -1412,6 +1417,7 @@ async def test_anthropic_oauth_system_prompt_prepend():
     # OAuth mode with system prompt
     client = AnthropicClient()
     client._client = _MockSDK()
+    client._current_key = "sk-ant-oat-test"
     client._is_oauth = True
 
     await client.complete(
@@ -1434,6 +1440,7 @@ async def test_anthropic_oauth_system_prompt_prepend():
     captured.clear()
     client2 = AnthropicClient()
     client2._client = _MockSDK()
+    client2._current_key = "sk-ant-oat-test"
     client2._is_oauth = True
 
     await client2.complete(
@@ -1465,6 +1472,7 @@ async def test_anthropic_non_oauth_system_prompt_unchanged():
 
     client = AnthropicClient()
     client._client = _MockSDK()
+    client._current_key = "sk-ant-api01-regular"
     client._is_oauth = False
 
     await client.complete(
@@ -1514,6 +1522,125 @@ async def test_anthropic_oauth_token_env_precedence():
             os.environ["ANTHROPIC_API_KEY"] = old_api
         elif "ANTHROPIC_API_KEY" in os.environ:
             del os.environ["ANTHROPIC_API_KEY"]
+
+
+async def test_anthropic_token_file_resolver():
+    """ARCGENERAL_TOKEN_FILE takes highest priority for anthropic provider."""
+    import tempfile
+    from arcgeneral.llm import default_api_key_resolver
+
+    resolver = default_api_key_resolver()
+
+    old_tf = os.environ.get("ARCGENERAL_TOKEN_FILE")
+    old_oauth = os.environ.get("ANTHROPIC_OAUTH_TOKEN")
+    old_api = os.environ.get("ANTHROPIC_API_KEY")
+    try:
+        # Write a token file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".token", delete=False) as f:
+            f.write("sk-ant-oat-from-token-file")
+            token_path = f.name
+
+        os.environ["ARCGENERAL_TOKEN_FILE"] = token_path
+        os.environ["ANTHROPIC_OAUTH_TOKEN"] = "sk-ant-oat-from-oauth-env"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-api01-from-api-env"
+
+        # Token file wins over both env vars
+        key = await resolver("anthropic")
+        report("token_file_wins", key == "sk-ant-oat-from-token-file")
+
+        # Token file updated: resolver picks up new value
+        with open(token_path, "w") as f:
+            f.write("sk-ant-oat-refreshed-token")
+        key2 = await resolver("anthropic")
+        report("token_file_refresh", key2 == "sk-ant-oat-refreshed-token")
+
+        # Token file deleted: falls through to env vars
+        os.unlink(token_path)
+        key3 = await resolver("anthropic")
+        report("token_file_deleted_fallback", key3 == "sk-ant-oat-from-oauth-env")
+
+        # Non-anthropic provider ignores token file
+        os.environ["OPENROUTER_API_KEY"] = "or-test-key"
+        key4 = await resolver("openrouter")
+        report("token_file_non_anthropic", key4 == "or-test-key")
+    finally:
+        if old_tf is not None:
+            os.environ["ARCGENERAL_TOKEN_FILE"] = old_tf
+        elif "ARCGENERAL_TOKEN_FILE" in os.environ:
+            del os.environ["ARCGENERAL_TOKEN_FILE"]
+        if old_oauth is not None:
+            os.environ["ANTHROPIC_OAUTH_TOKEN"] = old_oauth
+        elif "ANTHROPIC_OAUTH_TOKEN" in os.environ:
+            del os.environ["ANTHROPIC_OAUTH_TOKEN"]
+        if old_api is not None:
+            os.environ["ANTHROPIC_API_KEY"] = old_api
+        elif "ANTHROPIC_API_KEY" in os.environ:
+            del os.environ["ANTHROPIC_API_KEY"]
+        try:
+            os.unlink(token_path)
+        except OSError:
+            pass
+
+
+async def test_anthropic_client_key_change():
+    """AnthropicClient reconstructs SDK client when API key changes."""
+    import anthropic as _anthropic_mod
+
+    construction_log = []
+
+    class _MockMessages:
+        async def create(self, **kw):
+            return _AMessage(
+                content=[_ATextBlock(text="ok")],
+                usage=_AUsage(input_tokens=10, output_tokens=5),
+            )
+
+    class _SpyAnthropic:
+        def __init__(self, **kwargs):
+            construction_log.append(kwargs)
+            self.messages = _MockMessages()
+        async def close(self): pass
+
+    _orig_class = _anthropic_mod.AsyncAnthropic
+    _anthropic_mod.AsyncAnthropic = _SpyAnthropic
+    try:
+        client = AnthropicClient()
+
+        # First call: creates client
+        await client.complete(
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="sk-ant-oat-token-v1",
+            model="test",
+        )
+        report("key_change_first_build", len(construction_log) == 1)
+        report("key_change_first_auth", construction_log[0].get("auth_token") == "sk-ant-oat-token-v1")
+
+        # Same key: reuses client
+        await client.complete(
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="sk-ant-oat-token-v1",
+            model="test",
+        )
+        report("key_change_reuse", len(construction_log) == 1)
+
+        # Different key: reconstructs
+        await client.complete(
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="sk-ant-oat-token-v2",
+            model="test",
+        )
+        report("key_change_rebuild", len(construction_log) == 2)
+        report("key_change_new_auth", construction_log[1].get("auth_token") == "sk-ant-oat-token-v2")
+
+        # Old client deferred to _stale_client
+        report("key_change_stale_exists", client._stale_client is not None)
+
+        # close() cleans up both
+        await client.close()
+        report("key_change_stale_cleaned", client._stale_client is None)
+        report("key_change_client_cleaned", client._client is None)
+    finally:
+        _anthropic_mod.AsyncAnthropic = _orig_class
 async def test_llm_client_injection():
     """AgentRuntime uses an injected LLMClient instead of creating a default."""
     calls = []
@@ -2099,6 +2226,8 @@ async def main():
     await test_anthropic_oauth_system_prompt_prepend()
     await test_anthropic_non_oauth_system_prompt_unchanged()
     await test_anthropic_oauth_token_env_precedence()
+    await test_anthropic_token_file_resolver()
+    await test_anthropic_client_key_change()
 
     print("\nShutdown / SIGTERM tests:")
     await test_sigterm_clean_shutdown()

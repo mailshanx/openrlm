@@ -70,26 +70,39 @@ args.push("--model", ctx.model.id);
 - **Tool description changes** — Pi doesn't change descriptions for OAuth mode.
 - **Message/response translation changes** — already correct.
 
-## Token refresh concern
+## Token refresh for long-running tasks
 
-OAuth tokens expire. Pi refreshes them with file-locked reads of `~/.pi/agent/auth.json`. The arcgeneral subprocess does not have access to this mechanism. For runs shorter than the token's remaining lifetime (5-minute buffer), this is fine. For long runs, `messages.create()` will get a 401. Options:
+OAuth tokens expire. The extension now continuously refreshes the token via a file-based IPC channel.
 
-1. Accept the failure (simplest).
-2. On 401, re-read `~/.pi/agent/auth.json`, create a new SDK client with the refreshed token, retry.
-3. Implement the full file-lock refresh protocol from Python.
+### Architecture
+
+**Extension side** (arcgeneral-pi):
+- Creates a temp file, writes the initial token atomically (write tmp + rename)
+- Passes the file path to the subprocess as `ARCGENERAL_TOKEN_FILE` env var
+- Runs a `setInterval` (4 minutes) calling `ctx.modelRegistry.getApiKeyForProvider("anthropic")` and writing the refreshed token to the file
+- Cleans up the interval and file on process exit
+
+**arcgeneral side** (llm.py):
+- `default_api_key_resolver` checks `ARCGENERAL_TOKEN_FILE` first for the `anthropic` provider. Reads the file on every `_llm_call`.
+- `AnthropicClient._ensure_client` tracks the current key. When the key changes (refreshed token), it reconstructs the SDK client and defers the old one to `_stale_client` for cleanup in `close()`.
+
+### Resolution priority (anthropic provider)
+
+1. `ARCGENERAL_TOKEN_FILE` (read from file, refreshed by extension)
+2. `ANTHROPIC_OAUTH_TOKEN` (env var)
+3. `ANTHROPIC_API_KEY` (env var)
 
 ## Implementation Status
 
 All changes implemented and tested.
 
 ### Commits
-
 - `6292503` (arcgeneral) — AnthropicClient with OAuth stealth mode + tests (15 assertions)
 - `c7d200b` (arcgeneral) — ANTHROPIC_OAUTH_TOKEN env var precedence (3 assertions)
 - `38bc4d4` (arcgeneral-pi) — Bridge API key from Pi's model registry to subprocess
+- Token file refresh + key-change client reconstruction (pending commit)
 
 ### Verified against Pi's implementation
-
 | Aspect | Pi's implementation | arcgeneral | Match |
 |--------|-------------------|------------|-------|
 | Token detection | `apiKey.includes("sk-ant-oat")` | `"sk-ant-oat" in api_key` | ✅ |
@@ -102,7 +115,4 @@ All changes implemented and tested.
 | Tool renaming | `python` not in CC list, passthrough | No renaming | ✅ |
 | Env var precedence | `ANTHROPIC_OAUTH_TOKEN` > `ANTHROPIC_API_KEY` | Same | ✅ |
 | Token refresh at resolve time | `getApiKeyForProvider()` auto-refreshes | Handled by Pi before bridging | ✅ |
-
-### Known limitation
-
-Token expiry during long runs (>1 hour). Pi's `getApiKeyForProvider()` refreshes the token before handing it to the extension, but the arcgeneral subprocess reuses the SDK client for the full run. A 401 mid-run would require re-reading `~/.pi/agent/auth.json` and reconstructing the client.
+| Live token refresh | Per-request in `streamAnthropic` | Token file + key-change detection | ✅ |

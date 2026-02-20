@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json as _json
 import os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol
 
@@ -79,8 +80,16 @@ def default_api_key_resolver() -> Callable[[str], Awaitable[str]]:
         if env_var is None:
             # Unknown provider — try PROVIDER_API_KEY convention
             env_var = f"{provider.upper().replace('-', '_')}_API_KEY"
-        # Anthropic: check ANTHROPIC_OAUTH_TOKEN first (matches Pi's precedence)
+        # Token file takes highest priority (written by pi extension, refreshed on interval)
         if provider == "anthropic":
+            token_file = os.environ.get("ARCGENERAL_TOKEN_FILE")
+            if token_file:
+                try:
+                    key = Path(token_file).read_text().strip()
+                    if key:
+                        return key
+                except OSError:
+                    pass  # Fall through to env vars
             key = os.environ.get("ANTHROPIC_OAUTH_TOKEN") or os.environ.get(env_var, "")
         else:
             key = os.environ.get(env_var, "")
@@ -163,6 +172,8 @@ class AnthropicClient:
     def __init__(self):
         self._client = None  # lazily created
         self._is_oauth = False
+        self._current_key = None
+        self._stale_client = None
 
     # Stealth headers matching Pi's Anthropic OAuth implementation.
     # Required for OAuth tokens (sk-ant-oat-*) to be accepted by Anthropic's API.
@@ -174,17 +185,22 @@ class AnthropicClient:
     _OAUTH_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
     def _ensure_client(self, api_key: str):
         import anthropic
-        if self._client is None:
-            if "sk-ant-oat" in api_key:
-                self._client = anthropic.AsyncAnthropic(
-                    api_key=None,
-                    auth_token=api_key,
-                    default_headers=self._OAUTH_HEADERS,
-                )
-                self._is_oauth = True
-            else:
-                self._client = anthropic.AsyncAnthropic(api_key=api_key)
-                self._is_oauth = False
+        if self._client is not None and self._current_key == api_key:
+            return self._client
+        # Key changed or first call — (re)create client
+        if self._client is not None:
+            self._stale_client = self._client  # defer close to async close()
+        self._current_key = api_key
+        if "sk-ant-oat" in api_key:
+            self._client = anthropic.AsyncAnthropic(
+                api_key=None,
+                auth_token=api_key,
+                default_headers=self._OAUTH_HEADERS,
+            )
+            self._is_oauth = True
+        else:
+            self._client = anthropic.AsyncAnthropic(api_key=api_key)
+            self._is_oauth = False
         return self._client
 
     async def complete(self, messages: list[dict], *, api_key: str, **kwargs) -> CompletionResponse:
@@ -352,6 +368,9 @@ class AnthropicClient:
         )
 
     async def close(self) -> None:
+        if self._stale_client:
+            await self._stale_client.close()
+            self._stale_client = None
         if self._client is not None:
             await self._client.close()
             self._client = None
