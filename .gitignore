@@ -17,3 +17,6 @@ wheels/
 
 # Editor
 .vscode/
+
+# Docs
+docs/
