@@ -1524,50 +1524,64 @@ async def test_anthropic_oauth_token_env_precedence():
             del os.environ["ANTHROPIC_API_KEY"]
 
 
-async def test_anthropic_token_file_resolver():
-    """ARCGENERAL_TOKEN_FILE takes highest priority for anthropic provider."""
+async def test_auth_file_resolver():
+    """Auth file (~/.arcgeneral/auth.json) takes highest priority for all providers."""
     import tempfile
+    import json
     from arcgeneral.llm import default_api_key_resolver
-
     resolver = default_api_key_resolver()
 
-    old_tf = os.environ.get("ARCGENERAL_TOKEN_FILE")
+    old_af = os.environ.get("ARCGENERAL_AUTH_FILE")
     old_oauth = os.environ.get("ANTHROPIC_OAUTH_TOKEN")
     old_api = os.environ.get("ANTHROPIC_API_KEY")
+    old_or = os.environ.get("OPENROUTER_API_KEY")
+    auth_dir = tempfile.mkdtemp()
+    auth_path = os.path.join(auth_dir, "auth.json")
     try:
-        # Write a token file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".token", delete=False) as f:
-            f.write("sk-ant-oat-from-token-file")
-            token_path = f.name
-
-        os.environ["ARCGENERAL_TOKEN_FILE"] = token_path
+        os.environ["ARCGENERAL_AUTH_FILE"] = auth_path
         os.environ["ANTHROPIC_OAUTH_TOKEN"] = "sk-ant-oat-from-oauth-env"
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-api01-from-api-env"
+        os.environ["OPENROUTER_API_KEY"] = "or-from-env"
 
-        # Token file wins over both env vars
+        # Write auth file with anthropic key
+        with open(auth_path, "w") as f:
+            json.dump({"anthropic": "sk-ant-oat-from-auth-file"}, f)
+
+        # Auth file wins over env vars for anthropic
         key = await resolver("anthropic")
-        report("token_file_wins", key == "sk-ant-oat-from-token-file")
+        report("auth_file_wins_anthropic", key == "sk-ant-oat-from-auth-file")
 
-        # Token file updated: resolver picks up new value
-        with open(token_path, "w") as f:
-            f.write("sk-ant-oat-refreshed-token")
-        key2 = await resolver("anthropic")
-        report("token_file_refresh", key2 == "sk-ant-oat-refreshed-token")
+        # Provider not in auth file falls through to env var
+        key2 = await resolver("openrouter")
+        report("auth_file_fallthrough_env", key2 == "or-from-env")
 
-        # Token file deleted: falls through to env vars
-        os.unlink(token_path)
-        key3 = await resolver("anthropic")
-        report("token_file_deleted_fallback", key3 == "sk-ant-oat-from-oauth-env")
+        # Auth file works for non-anthropic providers too
+        with open(auth_path, "w") as f:
+            json.dump({"anthropic": "sk-ant-oat-from-auth-file", "openrouter": "or-from-auth-file"}, f)
+        key3 = await resolver("openrouter")
+        report("auth_file_wins_openrouter", key3 == "or-from-auth-file")
 
-        # Non-anthropic provider ignores token file
-        os.environ["OPENROUTER_API_KEY"] = "or-test-key"
-        key4 = await resolver("openrouter")
-        report("token_file_non_anthropic", key4 == "or-test-key")
+        # Auth file updated: resolver picks up new value (re-read every call)
+        with open(auth_path, "w") as f:
+            json.dump({"anthropic": "sk-ant-oat-refreshed"}, f)
+        key4 = await resolver("anthropic")
+        report("auth_file_refresh", key4 == "sk-ant-oat-refreshed")
+
+        # Auth file deleted: falls through to env vars
+        os.unlink(auth_path)
+        key5 = await resolver("anthropic")
+        report("auth_file_deleted_fallback", key5 == "sk-ant-oat-from-oauth-env")
+
+        # Invalid JSON in auth file: falls through gracefully
+        with open(auth_path, "w") as f:
+            f.write("not json")
+        key6 = await resolver("anthropic")
+        report("auth_file_invalid_json", key6 == "sk-ant-oat-from-oauth-env")
     finally:
-        if old_tf is not None:
-            os.environ["ARCGENERAL_TOKEN_FILE"] = old_tf
-        elif "ARCGENERAL_TOKEN_FILE" in os.environ:
-            del os.environ["ARCGENERAL_TOKEN_FILE"]
+        if old_af is not None:
+            os.environ["ARCGENERAL_AUTH_FILE"] = old_af
+        elif "ARCGENERAL_AUTH_FILE" in os.environ:
+            del os.environ["ARCGENERAL_AUTH_FILE"]
         if old_oauth is not None:
             os.environ["ANTHROPIC_OAUTH_TOKEN"] = old_oauth
         elif "ANTHROPIC_OAUTH_TOKEN" in os.environ:
@@ -1576,8 +1590,16 @@ async def test_anthropic_token_file_resolver():
             os.environ["ANTHROPIC_API_KEY"] = old_api
         elif "ANTHROPIC_API_KEY" in os.environ:
             del os.environ["ANTHROPIC_API_KEY"]
+        if old_or is not None:
+            os.environ["OPENROUTER_API_KEY"] = old_or
+        elif "OPENROUTER_API_KEY" in os.environ:
+            del os.environ["OPENROUTER_API_KEY"]
         try:
-            os.unlink(token_path)
+            os.unlink(auth_path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(auth_dir)
         except OSError:
             pass
 
@@ -2226,7 +2248,7 @@ async def main():
     await test_anthropic_oauth_system_prompt_prepend()
     await test_anthropic_non_oauth_system_prompt_unchanged()
     await test_anthropic_oauth_token_env_precedence()
-    await test_anthropic_token_file_resolver()
+    await test_auth_file_resolver()
     await test_anthropic_client_key_change()
 
     print("\nShutdown / SIGTERM tests:")

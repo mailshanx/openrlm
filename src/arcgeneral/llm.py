@@ -57,7 +57,6 @@ class LLMClient(Protocol):
 # ---------------------------------------------------------------------------
 # Provider → environment variable mapping
 # ---------------------------------------------------------------------------
-
 PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic":    "ANTHROPIC_API_KEY",
     "openai":       "OPENAI_API_KEY",
@@ -68,37 +67,63 @@ PROVIDER_ENV_VARS: dict[str, str] = {
     "mistral":      "MISTRAL_API_KEY",
 }
 
+_DEFAULT_AUTH_FILE = Path.home() / ".arcgeneral" / "auth.json"
+
+
+def _read_auth_file(provider: str) -> str | None:
+    """Read a provider's API key from the auth file.
+
+    The auth file is a JSON object mapping provider names to API keys:
+        {"anthropic": "sk-ant-...", "openrouter": "or-..."}
+
+    Location: ~/.arcgeneral/auth.json (override with ARCGENERAL_AUTH_FILE).
+    Re-read on every call so external refreshers (e.g. Pi extension) can
+    update it mid-run.
+    """
+    auth_path = os.environ.get("ARCGENERAL_AUTH_FILE")
+    path = Path(auth_path) if auth_path else _DEFAULT_AUTH_FILE
+    try:
+        data = _json.loads(path.read_text())
+        key = data.get(provider)
+        if isinstance(key, str) and key:
+            return key
+    except (OSError, ValueError, AttributeError):
+        pass  # File missing, invalid JSON, or wrong shape — fall through
+    return None
+
 
 def default_api_key_resolver() -> Callable[[str], Awaitable[str]]:
-    """Build a resolver that reads API keys from environment variables.
-
-    Returns an async callable: (provider) -> api_key.
-    The provider argument is used to look up the correct env var.
+    """Build a resolver that reads API keys from the auth file and environment.
+    Resolution priority for any provider:
+      1. Auth file (~/.arcgeneral/auth.json or ARCGENERAL_AUTH_FILE)
+      2. ANTHROPIC_OAUTH_TOKEN (Anthropic only, legacy compat)
+      3. Provider-specific env var (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, etc.)
     """
     async def resolve(provider: str) -> str:
+        # 1. Auth file (re-read every call — may be refreshed externally)
+        key = _read_auth_file(provider)
+        if key:
+            return key
+
+        # 2. Anthropic OAuth token (takes precedence over ANTHROPIC_API_KEY)
+        if provider == "anthropic":
+            key = os.environ.get("ANTHROPIC_OAUTH_TOKEN", "")
+            if key:
+                return key
+
+        # 3. Provider-specific env var
         env_var = PROVIDER_ENV_VARS.get(provider)
         if env_var is None:
-            # Unknown provider — try PROVIDER_API_KEY convention
             env_var = f"{provider.upper().replace('-', '_')}_API_KEY"
-        # Token file takes highest priority (written by pi extension, refreshed on interval)
-        if provider == "anthropic":
-            token_file = os.environ.get("ARCGENERAL_TOKEN_FILE")
-            if token_file:
-                try:
-                    key = Path(token_file).read_text().strip()
-                    if key:
-                        return key
-                except OSError:
-                    pass  # Fall through to env vars
-            key = os.environ.get("ANTHROPIC_OAUTH_TOKEN") or os.environ.get(env_var, "")
-        else:
-            key = os.environ.get(env_var, "")
-        if not key:
-            raise ValueError(
-                f"No API key for provider {provider!r}. "
-                f"Set the {env_var} environment variable."
-            )
-        return key
+        key = os.environ.get(env_var, "")
+        if key:
+            return key
+
+        raise ValueError(
+            f"No API key for provider {provider!r}. "
+            f"Set the {env_var} environment variable "
+            f"or add it to ~/.arcgeneral/auth.json."
+        )
     return resolve
 
 

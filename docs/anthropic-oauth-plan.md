@@ -45,24 +45,50 @@ elif system_content is not None:
     create_kwargs["system"] = system_content
 ```
 
-### 3. `arcgeneral-pi` extension — bridge the API key
+### 3. `arcgeneral-pi` extension — bridge the API key via auth file
 
-In `runArcgeneral`, resolve the key from Pi's auth system and inject it into the subprocess environment. Pass `--provider anthropic` and `--model`.
+The extension writes the provider's API key to `~/.arcgeneral/auth.json` before spawning the subprocess. A `setInterval` (4 minutes) refreshes the token for long-running tasks. On exit, the entry is removed.
 
 ```typescript
-const apiKey = await ctx.modelRegistry.getApiKeyForProvider("anthropic");
-const proc = spawn(bin, args, {
-    env: { ...process.env, ANTHROPIC_API_KEY: apiKey },
-});
-args.push("--provider", "anthropic");
-args.push("--model", ctx.model.id);
+// Write initial token
+writeAuthFile("anthropic", await tokenRefresher());
+
+// Refresh every 4 minutes
+refreshInterval = setInterval(async () => {
+    const newToken = await tokenRefresher();
+    if (newToken) writeAuthFile("anthropic", newToken);
+}, 240_000);
+
+// Cleanup on exit
+removeAuthEntry("anthropic");
 ```
 
-### 4. Tests
+Auth file format (`~/.arcgeneral/auth.json`):
+```json
+{"anthropic": "sk-ant-oat-..."}
+```
 
-- Mock `_ensure_client` with an OAuth token (`sk-ant-oat-test`): verify `auth_token` is used, `api_key` is `None`, stealth headers are set.
-- Mock `complete` with an OAuth token: verify system prompt is an array with Claude Code identity prepended.
-- Mock `complete` with a regular API key: verify system prompt is a plain string, no identity prepend.
+File permissions: directory `0o700`, file `0o600`. Writes are atomic (tmp + rename).
+
+### 4. `default_api_key_resolver` — auth file with 3-tier priority
+
+The resolver in `llm.py` reads the auth file on every `_llm_call`, so external refreshers (the Pi extension) can update it mid-run.
+
+Resolution priority for any provider:
+1. Auth file (`~/.arcgeneral/auth.json` or `ARCGENERAL_AUTH_FILE` env var override)
+2. `ANTHROPIC_OAUTH_TOKEN` (Anthropic only, legacy compat)
+3. Provider-specific env var (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, etc.)
+
+### 5. Key-change client reconstruction
+
+`AnthropicClient._ensure_client` tracks `_current_key`. When the key changes (refreshed token written to auth file → re-read by resolver), the SDK client is reconstructed. The old client is deferred to `_stale_client` for cleanup in `close()`.
+
+### 6. Tests
+
+- `test_auth_file_resolver()` — covers auth file wins, fallthrough to env var, non-anthropic providers, refresh (auth file changes between calls), deleted file, invalid JSON
+- OAuth token detection: verify `auth_token` is used, `api_key` is `None`, stealth headers are set
+- OAuth system prompt: verify array with Claude Code identity prepended
+- Regular API key: verify no identity prepend, plain string system prompt
 
 ## Not needed
 
@@ -70,39 +96,18 @@ args.push("--model", ctx.model.id);
 - **Tool description changes** — Pi doesn't change descriptions for OAuth mode.
 - **Message/response translation changes** — already correct.
 
-## Token refresh for long-running tasks
-
-OAuth tokens expire. The extension now continuously refreshes the token via a file-based IPC channel.
-
-### Architecture
-
-**Extension side** (arcgeneral-pi):
-- Creates a temp file, writes the initial token atomically (write tmp + rename)
-- Passes the file path to the subprocess as `ARCGENERAL_TOKEN_FILE` env var
-- Runs a `setInterval` (4 minutes) calling `ctx.modelRegistry.getApiKeyForProvider("anthropic")` and writing the refreshed token to the file
-- Cleans up the interval and file on process exit
-
-**arcgeneral side** (llm.py):
-- `default_api_key_resolver` checks `ARCGENERAL_TOKEN_FILE` first for the `anthropic` provider. Reads the file on every `_llm_call`.
-- `AnthropicClient._ensure_client` tracks the current key. When the key changes (refreshed token), it reconstructs the SDK client and defers the old one to `_stale_client` for cleanup in `close()`.
-
-### Resolution priority (anthropic provider)
-
-1. `ARCGENERAL_TOKEN_FILE` (read from file, refreshed by extension)
-2. `ANTHROPIC_OAUTH_TOKEN` (env var)
-3. `ANTHROPIC_API_KEY` (env var)
-
 ## Implementation Status
 
-All changes implemented and tested.
+All changes implemented and tested. 237 tests pass.
 
 ### Commits
+
 - `6292503` (arcgeneral) — AnthropicClient with OAuth stealth mode + tests (15 assertions)
-- `c7d200b` (arcgeneral) — ANTHROPIC_OAUTH_TOKEN env var precedence (3 assertions)
-- `38bc4d4` (arcgeneral-pi) — Bridge API key from Pi's model registry to subprocess
-- Token file refresh + key-change client reconstruction (pending commit)
+- `e965b5c` (arcgeneral) — Auth file system (`_read_auth_file`, `default_api_key_resolver` 3-tier priority, key-change client reconstruction)
+- `21fce12` (arcgeneral-pi) — Bridge API key + auth file refresh (`writeAuthFile`, `removeAuthEntry`, `resolveLLMConfig`, `tokenRefresher`)
 
 ### Verified against Pi's implementation
+
 | Aspect | Pi's implementation | arcgeneral | Match |
 |--------|-------------------|------------|-------|
 | Token detection | `apiKey.includes("sk-ant-oat")` | `"sk-ant-oat" in api_key` | ✅ |
@@ -113,6 +118,4 @@ All changes implemented and tested.
 | System prompt | Array of content blocks, identity first | Same | ✅ |
 | Identity string | `"You are Claude Code, Anthropic's official CLI for Claude."` | Same | ✅ |
 | Tool renaming | `python` not in CC list, passthrough | No renaming | ✅ |
-| Env var precedence | `ANTHROPIC_OAUTH_TOKEN` > `ANTHROPIC_API_KEY` | Same | ✅ |
-| Token refresh at resolve time | `getApiKeyForProvider()` auto-refreshes | Handled by Pi before bridging | ✅ |
-| Live token refresh | Per-request in `streamAnthropic` | Token file + key-change detection | ✅ |
+| Live token refresh | Per-request in `streamAnthropic` | Auth file re-read per `_llm_call` + key-change client reconstruction | ✅ |
