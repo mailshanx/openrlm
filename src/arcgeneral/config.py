@@ -10,8 +10,7 @@ if TYPE_CHECKING:
 @dataclass
 class AgentConfig:
     model: str = "openai/gpt-5.2"
-    provider: str = "openrouter"
-    get_api_key: Callable[[str], Awaitable[str]] | None = None
+    get_api_key: Callable[[], Awaitable[str]] | None = None
     system_prompt: str | None = None
     sandbox_image: str | None = None
     code_timeout: float = 3600.0

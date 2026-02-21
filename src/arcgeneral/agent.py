@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Self
 
-from arcgeneral.llm import LLMClient, OpenRouterClient, AnthropicClient, CompletionResponse, default_api_key_resolver
+from arcgeneral.llm import LLMClient, CompletionResponse
 
 from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
@@ -37,21 +37,21 @@ You work in a loop. Each iteration:
 2. You write at most ONE python tool call
 3. The system runs it and returns the console output
 
-This loop repeats \u2014 you will get multiple iterations. Do not try to do everything in a single \
+This loop repeats — you will get multiple iterations. Do not try to do everything in a single \
 python tool call. Break your work into steps: first explore and verify, then build on what works.
 
 When you have the final answer, respond to the user in plain text without calling the python tool.
 
 ### Rules
 1. The python tool is your ONLY tool. It executes code in a persistent Python REPL. All functions above are called with `await` INSIDE python \
-code \u2014 never as separate tool calls.
+code — never as separate tool calls.
 2. If code fails, read the traceback, fix the issue, and retry.
 3. Use `asyncio.gather()` to run independent tasks concurrently within a single python tool call.
 4. The working directory `{workspace_path}` is shared with the host. Files you create or modify there are visible on the host, and vice versa.
 5. If a package is not installed, run `subprocess.run(["uv", "pip", "install", "<package>"])` to install it.
 6. To save context space, only your latest user message and its tool interactions are shown in full \
-\u2014 earlier exchanges are condensed to user message + final response. Your complete history \
-including all tool calls, outputs, and errors is available as `_conversation_history` \u2014 a list \
+— earlier exchanges are condensed to user message + final response. Your complete history \
+including all tool calls, outputs, and errors is available as `_conversation_history` — a list \
 of message dicts (role, content, and optionally tool_calls or tool_call_id), updated after each step.
 
 ### Python REPL
@@ -110,6 +110,15 @@ After await_result(), understand what the sub-agent produced before deciding nex
 When delegating follow-up work, carry forward relevant findings from completed work into new tasks.
 """
 
+SUB_AGENT_SUFFIX = (
+    "\n\n## Your Role\n"
+    "You were created by another agent to accomplish a specific task. "
+    "Your final text response (when you stop calling tools) is returned to your creator as the result. "
+    "Be specific and structured in your output — it feeds into further work. "
+    "For large results, save to disk and return the file path in your response.\n"
+    "\n## Additional Instructions\n"
+)
+
 
 @dataclass
 class _SubAgent:
@@ -118,7 +127,6 @@ class _SubAgent:
     depth: int
     sandbox: Sandbox | None = None
     messages: list | None = None
-    request_kwargs: dict | None = None
     lock: asyncio.Lock = None  # serializes _run_turn calls per sub-agent
 
     def __post_init__(self):
@@ -138,9 +146,10 @@ class RuntimeServices:
     """
     llm_call: Callable[[list[dict], dict], Awaitable[CompletionResponse]]
     create_sandbox: Callable[[], Awaitable[Sandbox]]
-    init_messages: Callable[[AgentConfig, str | None], tuple[list, dict]]
+    build_system_message: Callable[[str | None], dict]
     config: AgentConfig
     spool_dir: Path
+    spool_path: str  # spool path as visible from inside the sandbox
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +164,10 @@ class Session:
     """
 
     def __init__(self, services: RuntimeServices, sandbox: Sandbox, messages: list,
-                 request_kwargs: dict, session_id: str, on_event=None):
+                 session_id: str, on_event=None):
         self._services = services
         self._sandbox = sandbox
         self._messages = messages
-        self._request_kwargs = request_kwargs
         self._session_id = session_id
         self._on_event = on_event
         self._sub_agents: dict[str, _SubAgent] = {}
@@ -171,38 +179,123 @@ class Session:
         """The caller-provided session ID."""
         return self._session_id
 
+    @property
+    def request_kwargs(self) -> dict:
+        kw: dict = {
+            "model": self._services.config.model,
+            "tools": [PYTHON_TOOL_SCHEMA],
+        }
+        if self._services.config.temperature is not None:
+            kw["temperature"] = self._services.config.temperature
+        return kw
+
+    @property
+    def system_message(self) -> dict:
+        """The system message for this session, with host function schemas and resolved paths.
+
+        Use this when constructing your own message list for run_turn.
+        """
+        return self._services.build_system_message(None)
+
+    @property
+    def messages(self) -> list[dict]:
+        """The session's internal message history.
+
+        This is the live list used by run_single. You may read or modify it
+        between turns. The same structural invariants that run_turn enforces
+        apply — violations will raise ValueError at the next turn.
+
+        If you want fully independent control, pass your own list to run_turn.
+        """
+        return self._messages
+
     # ── Public API ──
 
-    async def run_single(self, user_message: str) -> str:
-        """Run the agent loop for a single message. Returns the final text response.
+    async def run_turn(self, messages: list[dict], user_message: str) -> str:
+        """Run the agent loop for a single turn using the provided message list.
 
-        On CancelledError, cancels all sub-agent tasks spawned during this
-        turn so the entire agent tree is interrupted, then re-raises.
+        The engine borrows `messages` for the duration of the turn:
+        - Appends the user message
+        - Appends all assistant and tool messages produced by the loop
+        - On cancellation, rolls back everything it appended
+
+        The caller owns `messages` between turns and may mutate it freely,
+        subject to structural invariants:
+        - First element must be a system message
+        - Every assistant message with tool_calls must be followed by
+          matching tool result messages
+        - The list must not be mutated by another coroutine during the turn
+
+        Args:
+            messages: The conversation history. Modified in place.
+            user_message: The new user message to process.
+
+        Returns:
+            The assistant's final text response.
         """
         async with self._lock:
-            logger.info("[user] %s", user_message)
-            self._messages.append({"role": "user", "content": user_message})
+            messages.append({"role": "user", "content": user_message})
             try:
-                result = await self._run_turn(
-                    self._messages, self._sandbox, self._request_kwargs,
-                    agent_label="main",
-                )
-                logger.info("[assistant] %s", result)
+                self._validate_messages(messages)
+            except ValueError:
+                messages.pop()
+                raise
+            try:
+                result = await self._run_turn(messages, self._sandbox, agent_label="main")
                 return result
             except asyncio.CancelledError:
-                # Cancel all sub-agent tasks spawned during this turn
-                n_tasks = len(self._running_tasks)
                 for task_id, t in list(self._running_tasks.items()):
                     t.cancel()
                 if self._running_tasks:
                     await asyncio.gather(
-                        *self._running_tasks.values(),
-                        return_exceptions=True,
+                        *self._running_tasks.values(), return_exceptions=True,
                     )
                 self._running_tasks.clear()
-                logger.info("[session %s] Turn cancelled, %d sub-agent tasks cleaned up",
-                            self._session_id, n_tasks)
                 raise
+
+    async def run_single(self, user_message: str) -> str:
+        """Run the agent loop using the session's internal message history.
+
+        Convenience wrapper around run_turn for clients that don't need
+        to manage their own message list.
+        """
+        return await self.run_turn(self._messages, user_message)
+
+    @staticmethod
+    def _validate_messages(messages: list[dict]) -> None:
+        """Validate structural invariants required by the agent loop.
+
+        Raises ValueError with a specific message on violation.
+        """
+        if not messages:
+            raise ValueError("Message list must not be empty")
+        if messages[0].get("role") != "system":
+            raise ValueError("First message must have role 'system'")
+        if messages[-1].get("role") != "user":
+            raise ValueError("Last message must have role 'user' (the turn's input)")
+
+        # Validate tool_calls pairing
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                tool_calls = msg["tool_calls"]
+                expected_ids = {tc["id"] for tc in tool_calls}
+                found_ids = set()
+                j = i + 1
+                while j < len(messages) and messages[j].get("role") == "tool":
+                    found_ids.add(messages[j].get("tool_call_id"))
+                    j += 1
+                if found_ids != expected_ids:
+                    missing = expected_ids - found_ids
+                    extra = found_ids - expected_ids
+                    raise ValueError(
+                        f"Message {i}: assistant tool_calls not matched by tool messages. "
+                        f"Missing: {missing}, unexpected: {extra}"
+                    )
+                i = j
+            else:
+                i += 1
 
     async def close(self):
         """Close this session: cancel tasks, destroy sandboxes.
@@ -270,7 +363,7 @@ class Session:
                     await self._ensure_sub_sandbox(agent_id, sub)
                     sub.messages.append({"role": "user", "content": task})
                     result = await self._run_turn(
-                        sub.messages, sub.sandbox, sub.request_kwargs,
+                        sub.messages, sub.sandbox,
                         agent_label=agent_id,
                     )
                     logger.info("[session %s] Task %s on sub-agent %s finished",
@@ -302,17 +395,18 @@ class Session:
     # ── Agent loop ──
 
     async def _run_turn(self, full_history: list, sandbox: Sandbox,
-                        request_kwargs: dict, agent_label: str = "main") -> str:
+                        agent_label: str = "main") -> str:
         """Run one turn of the agent loop (LLM calls + tool calls until stop).
 
         Works for both the root agent and sub-agents — the caller passes the
-        appropriate messages/sandbox/request_kwargs for each.
+        appropriate messages/sandbox for each.
 
         On CancelledError, rolls back full_history to the start of the
         interrupted round so the message list stays consistent (every
         assistant tool_calls entry has matching tool results).
         """
         config = self._services.config
+        request_kwargs = self.request_kwargs
         on_event = self._on_event
         turn_start = time.monotonic()
         total_prompt_tokens = 0
@@ -394,7 +488,7 @@ class Session:
                         limit_lines=config.output_limit_lines,
                         limit_bytes=config.output_limit_bytes,
                         host_spool_dir=self._services.spool_dir,
-                        container_spool_dir=config.spool_path or "/app/spool",
+                        container_spool_dir=self._services.spool_path,
                     )
                     self._emit(on_event, ToolExecEnd(agent_id=agent_label, tool_name=tc.function.name, elapsed_seconds=time.monotonic() - tool_start))
                     logger.info("[%s] [tool result] %s", agent_label, result)
@@ -428,10 +522,7 @@ class Session:
         logger.info("[session %s] Creating sandbox for sub-agent %s", self._session_id, agent_id)
         sub.sandbox = await self._services.create_sandbox()
         await self._inject_agent_id(sub.sandbox, agent_id)
-        sub.messages, sub.request_kwargs = self._services.init_messages(
-            self._services.config,
-            extra_instructions=sub.instructions,
-        )
+        sub.messages = [self._services.build_system_message(sub.instructions)]
         logger.info("[session %s] Sub-agent %s ready", self._session_id, agent_id)
 
     @staticmethod
@@ -508,13 +599,12 @@ class AgentRuntime:
     correct Session via a flat routing table (_agent_to_session).
     """
 
-    def __init__(self, config: AgentConfig, registry: HostFunctionRegistry, llm_client: LLMClient | None = None):
+    def __init__(self, config: AgentConfig, registry: HostFunctionRegistry, llm_client: LLMClient):
         self._config = config
         self._registry = registry
         self._server: HostFunctionServer | None = None
         self._fork_server: ForkServer | None = None
         self._llm_client = llm_client
-        self._owns_llm_client = llm_client is None
 
         # Session tracking
         self._sessions: dict[str, Session] = {}
@@ -526,6 +616,10 @@ class AgentRuntime:
 
         # Spool dir for truncated output (temp dir, cleaned up on __aexit__)
         self._spool_dir: Path | None = None
+
+        # Resolved paths (populated in __aenter__, never mutate config)
+        self._workspace_path: str | None = None
+        self._spool_path: str | None = None
 
         # RuntimeServices — built lazily in __aenter__ once infrastructure is up
         self._services: RuntimeServices | None = None
@@ -558,8 +652,8 @@ class AgentRuntime:
                 host_function_server=self._server,
             )
             # Resolve paths as they appear inside the container
-            self._config.workspace_path = self._config.workspace_path or "/app/workspace/"
-            self._config.spool_path = self._config.spool_path or "/app/spool"
+            self._workspace_path = self._config.workspace_path or "/app/workspace/"
+            self._spool_path = self._config.spool_path or "/app/spool"
         else:
             # Local mode: fork server runs as a subprocess on the host
             self._fork_server = LocalForkServer(
@@ -570,29 +664,24 @@ class AgentRuntime:
             if workspace_candidates:
                 # Use the first bind's host path as workspace
                 workspace_host = list(self._config.sandbox_binds.keys())[0]
-                self._config.workspace_path = self._config.workspace_path or workspace_host
+                self._workspace_path = self._config.workspace_path or workspace_host
             else:
-                self._config.workspace_path = self._config.workspace_path or str(Path.cwd())
-            self._config.spool_path = self._config.spool_path or str(self._spool_dir)
+                self._workspace_path = self._config.workspace_path or str(Path.cwd())
+            self._spool_path = self._config.spool_path or str(self._spool_dir)
         await self._fork_server.__aenter__()
 
-        # Init API key resolver (default reads from env vars)
+        # Validate API key resolver
         if self._config.get_api_key is None:
-            self._config.get_api_key = default_api_key_resolver()
-        # Init LLM client (create default if none injected)
-        if self._llm_client is None:
-            if self._config.provider == "anthropic":
-                self._llm_client = AnthropicClient()
-            else:
-                self._llm_client = OpenRouterClient()
+            raise ValueError("AgentConfig.get_api_key must be provided")
 
         # Build the services bundle that Sessions will use
         self._services = RuntimeServices(
             llm_call=lambda msgs, kw: self._llm_call(msgs, kw),
             create_sandbox=self._fork_server.create_sandbox,
-            init_messages=self._init_messages,
+            build_system_message=self.build_system_message,
             config=self._config,
             spool_dir=self._spool_dir,
+            spool_path=self._spool_path,
         )
 
         return self
@@ -626,8 +715,8 @@ class AgentRuntime:
             finally:
                 self._server = None
 
-        # Close LLM client (only if we created it)
-        if self._owns_llm_client and self._llm_client is not None:
+        # Close LLM client
+        if self._llm_client is not None:
             try:
                 await self._llm_client.close()
             except Exception:
@@ -658,14 +747,13 @@ class AgentRuntime:
         if session_id in self._sessions:
             raise ValueError(f"Session {session_id!r} already exists")
         sandbox = await self._fork_server.create_sandbox()
-        messages, request_kwargs = self._init_messages(self._config)
+        messages = [self.build_system_message()]
         if context_messages:
             messages.extend(context_messages)
         session = Session(
             services=self._services,
             sandbox=sandbox,
             messages=messages,
-            request_kwargs=request_kwargs,
             session_id=session_id,
             on_event=on_event,
         )
@@ -705,39 +793,30 @@ class AgentRuntime:
 
     # ── Infrastructure services ──
 
-    def _init_messages(self, config: AgentConfig, extra_instructions: str | None = None) -> tuple[list, dict]:
-        """Seed the messages list and build request kwargs."""
-        messages: list = []
-        system_prompt = config.system_prompt if config.system_prompt is not None else DEFAULT_SYSTEM_PROMPT
-        functions_json = self._registry.build_schemas_json()
+    def build_system_message(self, extra_instructions: str | None = None) -> dict:
+        """Build the system message dict for root or sub-agents.
+
+        For root agents: call with no arguments.
+        For sub-agents: engine calls this internally with extra_instructions.
+        """
+        system_prompt = (
+            self._config.system_prompt
+            if self._config.system_prompt is not None
+            else DEFAULT_SYSTEM_PROMPT
+        )
         system_prompt = system_prompt.format(
-            functions_json=functions_json,
-            workspace_path=config.workspace_path or "/app/workspace/",
-            spool_path=config.spool_path or "/app/spool",
+            functions_json=self._registry.build_schemas_json(),
+            workspace_path=self._workspace_path,
+            spool_path=self._spool_path,
         )
         if extra_instructions:
-            system_prompt += (
-                "\n\n## Your Role\n"
-                "You were created by another agent to accomplish a specific task. "
-                "Your final text response (when you stop calling tools) is returned to your creator as the result. "
-                "Be specific and structured in your output \u2014 it feeds into further work. "
-                "For large results, save to disk and return the file path in your response.\n"
-                "\n## Additional Instructions\n" + extra_instructions
-            )
-        messages.append({"role": "system", "content": system_prompt})
-
-        request_kwargs: dict = {
-            "model": config.model,
-            "tools": [PYTHON_TOOL_SCHEMA],
-        }
-        if config.temperature is not None:
-            request_kwargs["temperature"] = config.temperature
-        return messages, request_kwargs
+            system_prompt += SUB_AGENT_SUFFIX + extra_instructions
+        return {"role": "system", "content": system_prompt}
 
     async def _llm_call(self, messages: list, request_kwargs: dict) -> CompletionResponse:
         """LLM call with retry on transient errors (4 attempts, exponential backoff)."""
         max_attempts = 4
-        api_key = await self._config.get_api_key(self._config.provider)
+        api_key = await self._config.get_api_key()
         for attempt in range(max_attempts):
             try:
                 return await self._llm_client.complete(
@@ -752,7 +831,7 @@ class AgentRuntime:
                 logger.warning("LLM call failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_attempts, wait, e)
                 await asyncio.sleep(wait)
                 # Re-resolve key on retry (may have been refreshed)
-                api_key = await self._config.get_api_key(self._config.provider)
+                api_key = await self._config.get_api_key()
 
     # ── Host functions (called from kernel via HTTP bridge) ──
     #

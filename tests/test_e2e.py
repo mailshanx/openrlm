@@ -34,6 +34,10 @@ from arcgeneral.llm import (
 TAG = "arcgeneral:sandbox"
 
 
+async def _test_api_key():
+    return "test-key"
+
+
 class _NullClient:
     """Mock LLM client that raises if accidentally called."""
     async def complete(self, messages, *, api_key="", **kwargs):
@@ -64,7 +68,7 @@ async def test_config_defaults():
     c = AgentConfig()
     report("config_defaults", all([
         c.model == "openai/gpt-5.2",
-        c.provider == "openrouter",
+        c.get_api_key is None,
         c.system_prompt is None,
         c.sandbox_image is None,
         c.code_timeout == 3600.0,
@@ -76,7 +80,7 @@ async def test_config_defaults():
 async def test_config_override():
     c = AgentConfig(
         model="openai/gpt-4o-mini",
-        provider="anthropic",
+        get_api_key=_test_api_key,
         system_prompt="You are a cat.",
         sandbox_image="custom:latest",
         code_timeout=30.0,
@@ -85,7 +89,7 @@ async def test_config_override():
     )
     report("config_override", all([
         c.model == "openai/gpt-4o-mini",
-        c.provider == "anthropic",
+        c.get_api_key is _test_api_key,
         c.system_prompt == "You are a cat.",
         c.sandbox_image == "custom:latest",
         c.code_timeout == 30.0,
@@ -616,12 +620,12 @@ async def test_host_function_path_serialization():
     Verifies that two concurrent run_agent calls on the same sub-agent are
     serialized end-to-end, not just at the fork server level.
     """
-    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     # Replace _run_turn on session: skip LLM, just execute the task string as code.
-    async def _mock_run_turn(full_history, sandbox, request_kwargs, agent_label=""):
+    async def _mock_run_turn(full_history, sandbox, agent_label=""):
         task = full_history[-1]["content"]
         result = await sandbox.execute(task, timeout=30.0)
         full_history.append({"role": "assistant", "content": result})
@@ -738,7 +742,7 @@ async def test_event_emission_two_rounds():
       TurnEnd(rounds=2)
     """
 
-    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
@@ -755,7 +759,7 @@ async def test_event_emission_two_rounds():
         messages.append({"role": "user", "content": "What is 2+2?"})
         result = await session._run_turn(
             messages, session._sandbox,
-            session._request_kwargs, agent_label="main",
+            agent_label="main",
         )
 
         check("event_count_9", lambda: len(events) == 9, f"got {len(events)}")
@@ -778,7 +782,7 @@ async def test_event_emission_two_rounds():
 async def test_event_emission_immediate():
     """_run_turn emits 4 events when LLM responds immediately (no tool calls)."""
 
-    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
@@ -794,7 +798,7 @@ async def test_event_emission_immediate():
         messages.append({"role": "user", "content": "Hi"})
         result = await session._run_turn(
             messages, session._sandbox,
-            session._request_kwargs, agent_label="main",
+            agent_label="main",
         )
 
         check("event_imm_count_4", lambda: len(events) == 4, f"got {len(events)}")
@@ -808,7 +812,7 @@ async def test_event_emission_immediate():
 async def test_event_callback_error_isolation():
     """A broken event callback must not crash _run_turn."""
 
-    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
@@ -825,7 +829,7 @@ async def test_event_callback_error_isolation():
         messages.append({"role": "user", "content": "Test"})
         result = await session._run_turn(
             messages, session._sandbox,
-            session._request_kwargs, agent_label="main",
+            agent_label="main",
         )
         check("event_error_isolation", lambda: result == "Survived")
 
@@ -833,7 +837,7 @@ async def test_event_callback_error_isolation():
 async def test_event_no_callback():
     """_run_turn works identically when _on_event is None (backward compat)."""
 
-    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
@@ -847,7 +851,7 @@ async def test_event_no_callback():
         messages.append({"role": "user", "content": "Test"})
         result = await session._run_turn(
             messages, session._sandbox,
-            session._request_kwargs, agent_label="main",
+            agent_label="main",
         )
         check("event_no_callback", lambda: result == "No events")
 
@@ -868,7 +872,7 @@ async def test_event_sub_agent_propagation():
       Main  RoundStart(1) ModelRequest ModelResponse(no_tools) TurnEnd
     """
 
-    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
@@ -893,7 +897,7 @@ print(f'sub says: {result}')"""
         messages.append({"role": "user", "content": "Use a sub-agent"})
         result = await session._run_turn(
             messages, session._sandbox,
-            session._request_kwargs, agent_label="main",
+            agent_label="main",
         )
 
         check("event_sub_count_13", lambda: len(events) == 13, f"got {len(events)}")
@@ -1139,9 +1143,8 @@ async def test_anthropic_translate_full_turn():
     client._client = _MockSDK()
     client._current_key = "test-key"
 
-    config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic", sandbox_image=None)
+    config = AgentConfig(model="claude-sonnet-4-5-20250514", get_api_key=_test_api_key, sandbox_image=None)
     runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=client)
-    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     async with runtime:
         session = await runtime.create_session("xlate-test")
         result = await session.run_single("What is 2+2?")
@@ -1282,13 +1285,13 @@ async def test_anthropic_translate_multi_turn_compressed():
 
 
 async def test_anthropic_auto_select():
-    """AgentRuntime auto-selects AnthropicClient when provider=anthropic."""
-    config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic", sandbox_image=None)
-    runtime = AgentRuntime(config, HostFunctionRegistry())
-    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-for-autoselect")
+    """AgentRuntime uses the injected LLM client (auto-selection removed)."""
+    client = AnthropicClient()
+    config = AgentConfig(model="claude-sonnet-4-5-20250514", get_api_key=_test_api_key, sandbox_image=None)
+    runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=client)
     async with runtime:
         report("anthropic_auto_select", isinstance(runtime._llm_client, AnthropicClient))
-        report("anthropic_auto_owns", runtime._owns_llm_client is True)
+        report("anthropic_auto_owns", True)  # engine always closes client now
 
 
 async def test_anthropic_oauth_client_construction():
@@ -1681,7 +1684,7 @@ async def test_llm_client_injection():
         async def close(self):
             pass
 
-    config = AgentConfig(model="injected-model", sandbox_image=TAG)
+    config = AgentConfig(model="injected-model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=MockClient())
 
@@ -1693,7 +1696,7 @@ async def test_llm_client_injection():
     report("llm_injection_result", result == "from injected")
 
 async def test_llm_client_lifecycle_ownership():
-    """Injected client is NOT closed on __aexit__; default client IS closed."""
+    """Engine always closes the LLM client on __aexit__."""
     closed = []
 
     class TrackingClient:
@@ -1709,7 +1712,7 @@ async def test_llm_client_lifecycle_ownership():
         async def close(self):
             closed.append(True)
 
-    config = AgentConfig(model="test", sandbox_image=TAG)
+    config = AgentConfig(model="test", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     injected = TrackingClient()
     runtime = AgentRuntime(config, registry, llm_client=injected)
@@ -1718,10 +1721,8 @@ async def test_llm_client_lifecycle_ownership():
         session = await runtime.create_session("test")
         await session.run_single("test lifecycle")
 
-    report("llm_injected_not_closed", len(closed) == 0)
-
-    # Verify the runtime knows it doesn't own the client
-    report("llm_owns_flag_false", not runtime._owns_llm_client)
+    # Engine always closes the LLM client now
+    report("llm_injected_closed", len(closed) == 1)
 
 async def test_sigterm_clean_shutdown():
     """SIGTERM during an active session triggers clean teardown:
@@ -1745,7 +1746,7 @@ async def test_sigterm_clean_shutdown():
         async def close(self):
             closed_llm.append(True)
 
-    config = AgentConfig(model="test", sandbox_image=TAG)
+    config = AgentConfig(model="test", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     client = SlowClient()
     runtime = AgentRuntime(config, registry, llm_client=client)
@@ -1781,19 +1782,19 @@ async def test_sigterm_clean_shutdown():
     report("sigterm_task_map_cleared", len(runtime._task_to_session) == 0)
     report("sigterm_fork_server_gone", runtime._fork_server is None)
     report("sigterm_host_server_gone", runtime._server is None)
-    report("sigterm_injected_not_closed", len(closed_llm) == 0)
+    report("sigterm_injected_closed", len(closed_llm) == 1)
 
 
 async def test_sigterm_cancels_inflight_subtasks():
     """When a session closes, running sub-agent tasks are cancelled."""
 
-    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     # Mock _run_turn on session: for sub-agents, sleep forever to simulate long work
     cancelled = []
-    async def _mock_run_turn(full_history, sandbox, request_kwargs, agent_label=""):
+    async def _mock_run_turn(full_history, sandbox, agent_label=""):
         if agent_label != "main":
             try:
                 await asyncio.sleep(3600)  # simulate long sub-agent work
@@ -1863,7 +1864,7 @@ async def test_cancellation_rolls_back_history():
         async def close(self):
             pass
 
-    config = AgentConfig(model="test", sandbox_image=TAG)
+    config = AgentConfig(model="test", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     client = CancellingClient()
     runtime = AgentRuntime(config, registry, llm_client=client)
@@ -1881,7 +1882,7 @@ async def test_cancellation_rolls_back_history():
         turn_task = asyncio.create_task(
             session._run_turn(
                 messages, session._sandbox,
-                session._request_kwargs, agent_label="main",
+                agent_label="main",
             )
         )
 
@@ -2005,12 +2006,12 @@ async def test_cancel_run_single_cleans_subtasks():
     - _running_tasks is cleared
     - session remains usable for a follow-up turn
     """
-    config = AgentConfig(model="test/model", sandbox_image=TAG)
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 
     cancelled_agents = []
-    async def _mock_run_turn(full_history, sandbox, request_kwargs, agent_label="main"):
+    async def _mock_run_turn(full_history, sandbox, agent_label="main"):
         if agent_label != "main":
             # Sub-agent: sleep forever until cancelled
             try:
@@ -2092,7 +2093,7 @@ print(f'sub says: {result}')"""
             raise RuntimeError("Mock LLM exhausted unexpectedly")
         return responses.pop(0)
 
-    config = AgentConfig(model="test/model", sandbox_image=None)  # local mode
+    config = AgentConfig(model="test/model", sandbox_image=None, get_api_key=_test_api_key)  # local mode
     registry = HostFunctionRegistry()
     runtime = AgentRuntime(config, registry, llm_client=_NullClient())
 

@@ -13,6 +13,11 @@ from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry
 from arcgeneral.sandbox import cleanup_orphaned_containers
 from arcgeneral.agent import AgentRuntime
+from arcgeneral.llm import (
+    OpenRouterClient,
+    AnthropicClient,
+    default_api_key_resolver,
+)
 
 
 def _load_module_from_file(filepath: Path) -> object:
@@ -72,6 +77,12 @@ def _load_functions(registry: HostFunctionRegistry, specs: list[str]) -> None:
                     f"uv tool install arcgeneral --with <package>"
                 ) from e
             _register_module(registry, module, spec)
+
+def _build_llm_client(provider: str):
+    if provider == "anthropic":
+        return AnthropicClient()
+    else:
+        return OpenRouterClient()
 
 
 def parse_args() -> argparse.Namespace:
@@ -209,17 +220,19 @@ def main():
                 raise SystemExit(f"Error: context message {i} has invalid role {msg['role']!r} (expected user or assistant)")
         context_messages = raw
 
+    resolver = default_api_key_resolver()
     config = AgentConfig(
         model=args.model,
-        provider=args.provider,
+        get_api_key=lambda: resolver(args.provider),
         sandbox_image=args.image,  # None = local mode
         code_timeout=args.timeout,
         max_tool_rounds=args.max_rounds,
         sandbox_binds={str(Path(args.workspace).resolve() if args.workspace else Path.cwd()): "workspace"},
     )
 
+    llm_client = _build_llm_client(args.provider)
     # create_agent/run_agent are registered by AgentRuntime.__init__
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=llm_client)
 
     if args.message is None and args.json:
         raise SystemExit("Error: --json requires a message argument (not interactive mode)")
