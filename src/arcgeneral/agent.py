@@ -410,6 +410,7 @@ class Session:
         turn_start = time.monotonic()
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        logger.info("[%s] [user] %s", agent_label, full_history[-1].get("content", ""))
         for round_num in range(config.max_tool_rounds):
             checkpoint = len(full_history)
             try:
