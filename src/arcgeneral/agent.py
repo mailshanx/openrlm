@@ -49,8 +49,7 @@ code — never as separate tool calls.
 3. Use `asyncio.gather()` to run independent tasks concurrently within a single python tool call.
 4. The working directory `{workspace_path}` is shared with the host. Files you create or modify there are visible on the host, and vice versa.
 5. If a package is not installed, run `subprocess.run(["uv", "pip", "install", "<package>"])` to install it.
-6. To save context space, only your latest user message and its tool interactions are shown in full \
-— earlier exchanges are condensed to user message + final response. Your complete history \
+6. To save context space, tool outputs from earlier exchanges are truncated. Your complete history \
 including all tool calls, outputs, and errors is available as `_conversation_history` — a list \
 of message dicts (role, content, and optionally tool_calls or tool_call_id), updated after each step.
 
@@ -551,28 +550,39 @@ class Session:
             logger.debug("Failed to sync conversation history to kernel", exc_info=True)
 
     @staticmethod
+    def _truncate_tool_output(content: str, max_lines: int = 20, max_bytes: int = 1024) -> str:
+        """Truncate tool output, keeping the last max_lines / max_bytes."""
+        if not content:
+            return content
+        lines = content.split("\n")
+        if len(lines) <= max_lines and len(content.encode("utf-8", errors="replace")) <= max_bytes:
+            return content
+        # Line limit (keep tail)
+        truncated = "\n".join(lines[-max_lines:])
+        # Byte limit (keep tail)
+        encoded = truncated.encode("utf-8", errors="replace")
+        if len(encoded) > max_bytes:
+            truncated = encoded[-max_bytes:].decode("utf-8", errors="ignore")
+        return "[truncated] ...\n" + truncated
+
+    @staticmethod
     def _compress_messages(full_history: list) -> list:
-        """Compress previous turns to user+final-assistant only. Current turn kept in full."""
+        """Compress previous turns: keep all messages but truncate tool outputs. Current turn kept in full."""
         # Find the last user message — everything from there is the current turn
         last_user_idx = None
         for i in range(len(full_history) - 1, -1, -1):
             if full_history[i].get("role") == "user":
                 last_user_idx = i
                 break
-
         if last_user_idx is None:
             return list(full_history)
-
-        # Previous turns: keep system, user, and final assistant (no tool_calls) only
+        # Previous turns: keep all messages, but truncate tool result content
         compressed = []
         for msg in full_history[:last_user_idx]:
-            role = msg.get("role")
-            if role in ("system", "user"):
+            if msg.get("role") == "tool":
+                compressed.append({**msg, "content": Session._truncate_tool_output(msg.get("content", ""))})
+            else:
                 compressed.append(msg)
-            elif role == "assistant" and "tool_calls" not in msg:
-                compressed.append(msg)
-            # Drop: assistant with tool_calls, tool results
-
         # Current turn: everything from last user message onward
         compressed.extend(full_history[last_user_idx:])
         return compressed

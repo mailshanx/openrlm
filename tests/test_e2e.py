@@ -1206,18 +1206,12 @@ async def test_anthropic_translate_full_turn():
 
 
 async def test_anthropic_translate_multi_turn_compressed():
-    """Verify message translation after _compress_messages strips intermediate tool calls.
+    """Verify Anthropic message translation handles consecutive same-role messages.
 
-    In multi-turn, previous turns are compressed to user + final assistant (no tool_calls).
-    The current turn retains full detail. This can produce consecutive user messages
-    or consecutive assistant messages, which Anthropic rejects — verify they get merged.
+    This can happen if a caller constructs a message list with consecutive user
+    messages (e.g., context injection between turns). Anthropic rejects these,
+    so the client must merge them.
     """
-    # Simulate a compressed history from _compress_messages:
-    #   system, user(turn1), assistant(turn1 final), user(turn2), assistant(tool_calls), tool, ...
-    # _compress_messages drops assistant-with-tool_calls from old turns, keeping only
-    # the final text assistant. So turns look like: user, assistant, user, assistant, ...
-    # No merging issue in the normal case. But if an old turn had no final text response
-    # (e.g., max_tool_rounds hit), we'd get: user, user (consecutive).
 
     captured_msgs = []
 
@@ -1238,8 +1232,8 @@ async def test_anthropic_translate_multi_turn_compressed():
     client._client = _MockSDK()
     client._current_key = "test-key"
 
-    # Manually build a compressed history with consecutive user messages
-    # (simulating what _compress_messages could produce)
+    # Manually build a history with consecutive user messages
+    # (simulating context injection that produces adjacent user messages)
     compressed = [
         {"role": "system", "content": "system prompt"},
         {"role": "user", "content": "turn 1 question"},
