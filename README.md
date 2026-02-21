@@ -59,7 +59,7 @@ The fork server pre-imports expensive packages once, calls `gc.freeze()`, then f
 For multi-turn conversations, call `run_single()` repeatedly on the same session. The harness manages what accumulates between turns:
 
 - **Message history.** Each `run_single()` appends the user message and final assistant response. REPL state (variables, imports, computed results) also persists.
-- **Message compression.** Previous turns are compressed to just user message + final assistant response. The current turn retains full tool call detail. The complete uncompressed history is available inside the REPL as `_conversation_history`.
+- **Message compression.** All messages from previous turns are preserved, but tool outputs are truncated to 20 lines / 1 KB. The current turn retains full tool call detail. The complete uncompressed history is available inside the REPL as `_conversation_history`.
 - **Cancellation.** Cancelling a turn (via `asyncio.CancelledError` or Ctrl-C) rolls back message history to the last consistent checkpoint. Sub-agent tasks are cancelled transitively.
 
 ```python
