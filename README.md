@@ -21,16 +21,21 @@ arcgeneral has two layers: a **core** that handles single-message execution, and
 
 The core takes a single message and runs a complete LLM↔REPL loop: the LLM emits a `python` tool call, the core executes it in a persistent IPython sandbox, returns the output, and repeats until the LLM responds with text. Everything — computation, file I/O, web requests, sub-agent orchestration — is Python code the LLM writes and runs through that single tool. Host functions you register appear as plain `await fn(...)` calls inside the sandbox. Sub-agent functions (`create_agent`, `run_agent`, `await_result`) work the same way — the LLM doesn’t know these are remote calls.
 
-`AgentRuntime` owns the infrastructure: the fork server (process lifecycle), the host function server (HTTP bridge for custom tools), the LLM client (pluggable — built-in support for OpenRouter and Anthropic), and sub-agent routing. It routes sub-agent calls through flat lookup tables so agents at any nesting depth resolve to the correct session.
+`AgentRuntime` owns the infrastructure: the fork server (process lifecycle), the host function server (HTTP bridge for custom tools), and sub-agent routing. The LLM client is pluggable — you provide any implementation of the `LLMClient` protocol. It routes sub-agent calls through flat lookup tables so agents at any nesting depth resolve to the correct session.
 
 ```python
 import asyncio
 from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
+from arcgeneral import OpenRouterClient, default_api_key_resolver
 
 async def main():
-    config = AgentConfig(model="openai/gpt-5.2", provider="openrouter")
+    resolver = default_api_key_resolver()
+    config = AgentConfig(
+        model="openai/gpt-5.2",
+        get_api_key=lambda: resolver("openrouter"),
+    )
     registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry)
+    runtime = AgentRuntime(config, registry, llm_client=OpenRouterClient())
 
     async with runtime:
         session = await runtime.create_session("my-session")
@@ -76,7 +81,23 @@ async with runtime:
 
 The caller provides user messages and consumes response strings. Everything else — message accumulation, compression, tool execution, history sync — happens inside the Session. Each Session is independent; multiple Sessions can run concurrently on the same Runtime.
 
-**Building your own harness.** If you need different message management — custom compression, external history storage, your own context window strategy — use `AgentRuntime` and call `session.run_single()` for one-shot execution, but manage conversation state yourself between calls. What you’re replacing is the multi-turn accumulation logic, not the LLM loop or execution infrastructure.
+**Client-owned conversation history.** If you need to manage message history yourself — injecting context between turns, forking conversations, external history storage — use `session.run_turn(messages, user_message)` instead of `run_single`. You construct the message list starting with `session.system_message`, pass it to each turn, and freely modify it between turns. The engine borrows the list during a turn and returns it enriched. `run_single` is a convenience wrapper that uses an engine-internal list.
+
+```python
+async with runtime:
+    session = await runtime.create_session("analysis")
+    messages = [session.system_message]
+
+    result = await session.run_turn(messages, "Load data.csv")
+    print(result)
+
+    # Inject context between turns
+    messages.append({"role": "user", "content": "(Note: focus on Q4 data)"})
+    messages.append({"role": "assistant", "content": "Understood."})
+
+    result = await session.run_turn(messages, "Summarize revenue trends")
+    print(result)
+```
 
 ## Installation
 
@@ -162,7 +183,7 @@ registry = HostFunctionRegistry()
 registry.register("my_database_query", my_database_query)
 
 # The registry is passed to the runtime, which injects the functions into every agent's REPL
-runtime = AgentRuntime(AgentConfig(), registry)
+runtime = AgentRuntime(config, registry, llm_client=client)
 ```
 
 Inside the agent's REPL, the function becomes callable as:
@@ -280,7 +301,6 @@ The maximum recursion depth is configurable (default: 10 levels).
 | Parameter | Default | Description |
 |---|---|---|
 | `model` | `"openai/gpt-5.2"` | Model identifier |
-| `provider` | `"openrouter"` | LLM provider: `"openrouter"` (default) or `"anthropic"` for native Anthropic API |
 | `sandbox_image` | `None` | Docker image tag; `None` for local mode |
 | `code_timeout` | `3600.0` | Code execution timeout in seconds |
 | `max_tool_rounds` | `50` | Max LLM-tool iterations per turn |
@@ -289,13 +309,16 @@ The maximum recursion depth is configurable (default: 10 levels).
 | `output_limit_bytes` | `50000` | Truncate tool output beyond this many bytes |
 | `temperature` | `None` | LLM sampling temperature |
 | `system_prompt` | `None` | Override the default system prompt (format string with `{functions_json}`, `{workspace_path}`, `{spool_path}` placeholders) |
-| `get_api_key` | `None` | Custom async key resolver `(provider: str) -> str`; default reads env vars |
+| `get_api_key` | `None` | `Callable[[], Awaitable[str]]` that returns an API key; required when using `AgentRuntime` |
 | `sandbox_binds` | `{}` | Host-to-container directory mounts (Docker mode) |
 
-### Environment Variables
+### API Key Resolution
 
-API keys are resolved from provider-specific environment variables:
+`AgentConfig.get_api_key` is caller-provided. The bundled `default_api_key_resolver()` checks these sources in order:
 
+1. **Auth file** (`~/.arcgeneral/auth.json`, override with `ARCGENERAL_AUTH_FILE`): a JSON object mapping provider names to keys.
+2. **`ANTHROPIC_OAUTH_TOKEN`** (Anthropic only, legacy compatibility).
+3. **Provider-specific environment variable:**
 | Provider | Environment Variable |
 |---|---|
 | `openrouter` | `OPENROUTER_API_KEY` |
@@ -357,7 +380,7 @@ Wraps the result in a JSON object for programmatic consumption. Only valid with 
 {"result": "The answer is 42", "error": null}
 
 // Failure
-{"result": null, "error": "API key not found for provider 'openai'"}
+{"result": null, "error": "No API key for provider 'openrouter'. Set the OPENROUTER_API_KEY environment variable or add it to ~/.arcgeneral/auth.json."}
 ```
 
 Exactly one of `result` or `error` is non-null.
@@ -381,26 +404,35 @@ arcgeneral --functions ./contrib "search for recent papers on transformer effici
 ```
 
 ## LLM Client
-arcgeneral ships with two built-in providers:
 
-- **OpenRouter** (default) — routes to models from OpenAI, Anthropic, Google, and others through a single API.
-- **Anthropic** — calls the Anthropic API directly.
+arcgeneral ships with two bundled client implementations:
+
+- **OpenRouterClient** — routes to models from OpenAI, Anthropic, Google, and others through a single API.
+- **AnthropicClient** — calls the Anthropic API directly.
+
+The caller constructs the client and passes it to `AgentRuntime`:
 
 ```python
-# OpenRouter (default) — model names are provider-prefixed
-config = AgentConfig(model="openai/gpt-5.2", provider="openrouter")
+from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
+from arcgeneral import OpenRouterClient, AnthropicClient, default_api_key_resolver
+
+resolver = default_api_key_resolver()
+
+# OpenRouter — model names are provider-prefixed
+config = AgentConfig(model="openai/gpt-5.2", get_api_key=lambda: resolver("openrouter"))
+runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=OpenRouterClient())
 
 # Anthropic — bare model names
-config = AgentConfig(model="claude-sonnet-4-5-20250514", provider="anthropic")
+config = AgentConfig(model="claude-sonnet-4-5-20250514", get_api_key=lambda: resolver("anthropic"))
+runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=AnthropicClient())
 ```
-
 Both manage HTTP connection pools internally and clean up when the runtime exits.
 
 For other providers, implement the `LLMClient` protocol and inject it:
 
 ```python
 from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
-from arcgeneral import LLMClient, CompletionResponse, CompletionChoice, CompletionMessage, TokenUsage
+from arcgeneral import LLMClient, CompletionResponse, CompletionChoice, CompletionMessage, TokenUsage, default_api_key_resolver
 
 class MyCustomClient:
     """Example: implement LLMClient for a provider not built in."""
@@ -421,18 +453,16 @@ class MyCustomClient:
 
 async def main():
     client = MyCustomClient()
-    runtime = AgentRuntime(AgentConfig(), HostFunctionRegistry(), llm_client=client)
+    resolver = default_api_key_resolver()
+    config = AgentConfig(get_api_key=lambda: resolver("my-provider"))
+    runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=client)
 
-    try:
-        async with runtime:
-            session = await runtime.create_session("s1")
-            result = await session.run_single("What is 2 + 2?")
-            print(result)
-            await runtime.close_session("s1")
-    finally:
-        # You injected the client, so you close it.
-        # The runtime only auto-closes clients it created itself.
-        await client.close()
+    async with runtime:
+        session = await runtime.create_session("s1")
+        result = await session.run_single("What is 2 + 2?")
+        print(result)
+        await runtime.close_session("s1")
+    # Runtime closes the LLM client on exit.
 ```
 
 ## Development
