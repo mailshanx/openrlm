@@ -3,6 +3,8 @@ import asyncio
 import importlib
 import importlib.util
 import json
+import dataclasses
+import sys
 import logging
 import signal
 import textwrap
@@ -153,7 +155,7 @@ def parse_args() -> argparse.Namespace:
                         help="JSON file with conversation history to prepend "
                              '(array of {"role": "user"|"assistant", "content": "..."})')
     parser.add_argument("--json", action="store_true",
-                        help="Output result as JSON object")
+                        help="Output result as JSON on stdout; stream agent events as JSONL on stderr")
     parser.add_argument("--build-image", type=str, nargs="?", const="arcgeneral:sandbox",
                         default=None, metavar="TAG",
                         help="Build the Docker sandbox image and exit (default tag: arcgeneral:sandbox)")
@@ -240,8 +242,14 @@ def main():
         async def _run():
             if args.image:
                 await cleanup_orphaned_containers()
+            on_event = None
+            if args.json:
+                def on_event(event):
+                    line = json.dumps({"type": type(event).__name__, **dataclasses.asdict(event)})
+                    sys.stderr.write(line + "\n")
+                    sys.stderr.flush()
             async with runtime:
-                session = await runtime.create_session("cli", context_messages=context_messages)
+                session = await runtime.create_session("cli", on_event=on_event, context_messages=context_messages)
                 result = await session.run_single(args.message)
                 await runtime.close_session("cli")
                 return result
