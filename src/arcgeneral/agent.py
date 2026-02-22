@@ -15,7 +15,8 @@ from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
 from arcgeneral.sandbox import ForkServer, LocalForkServer, Sandbox
 from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
-from arcgeneral.events import AgentEvent, RoundStart, ModelRequest, ModelResponse, ToolExecStart, ToolExecEnd, TurnEnd
+from arcgeneral.events import (AgentEvent, RoundStart, ModelRequest, ModelResponse, ToolExecStart,
+                               ToolExecEnd, TurnEnd, AgentCreated, TaskStarted, TaskCompleted)
 
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,7 @@ class _SubAgent:
     """State for a sub-agent created by the main agent."""
     instructions: str
     depth: int
+    parent_id: str = "main"
     sandbox: Sandbox | None = None
     messages: list | None = None
     forked_messages: list | None = None
@@ -356,13 +358,14 @@ class Session:
         return sub.depth if sub else 0
 
     def register_sub_agent(self, agent_id: str, instructions: str, depth: int,
+                           parent_id: str = "main",
                            fork_from: str | None = None) -> None:
         """Register a new sub-agent in this session's agent tree.
-
         Args:
             agent_id: Unique identifier for the new sub-agent.
             instructions: Role/instructions for the sub-agent's system prompt.
             depth: Depth in the agent tree (parent depth + 1).
+            parent_id: The agent_id of the agent that created this sub-agent.
             fork_from: If set, the agent_id whose message history
                        should be copied into the new sub-agent. The sub-agent
                        starts with the forked conversation context instead of
@@ -376,13 +379,15 @@ class Session:
                 source = self._messages  # root agent
             if source is not None:
                 forked = list(source)  # snapshot
-        logger.info("[session %s] Registered sub-agent %s (depth=%d%s)", self._session_id, agent_id, depth,
-                     ", forked" if forked else "")
+        logger.info("[session %s] Registered sub-agent %s (depth=%d, parent=%s%s)", self._session_id, agent_id, depth,
+                     parent_id, ", forked" if forked else "")
         self._sub_agents[agent_id] = _SubAgent(
             instructions=instructions,
             depth=depth,
+            parent_id=parent_id,
             forked_messages=forked,
         )
+        self._emit(self._on_event, AgentCreated(agent_id=agent_id, parent_id=parent_id, depth=depth))
 
     async def start_sub_task(self, agent_id: str, task: str) -> str:
         """Start a background task on a sub-agent. Returns task_id.
@@ -402,6 +407,7 @@ class Session:
             try:
                 async with sub.lock:
                     await self._ensure_sub_sandbox(agent_id, sub)
+                    self._emit(self._on_event, TaskStarted(agent_id=agent_id, task_id=task_id, task=task))
                     if sub._first_task:
                         content = SUB_AGENT_PREAMBLE.format(instructions=sub.instructions) + task
                         sub._first_task = False
@@ -414,6 +420,7 @@ class Session:
                     )
                     logger.info("[session %s] Task %s on sub-agent %s finished",
                                  self._session_id, task_id, agent_id)
+                    self._emit(self._on_event, TaskCompleted(agent_id=agent_id, task_id=task_id))
                     return result
             except asyncio.CancelledError:
                 logger.info("[session %s] Task %s on sub-agent %s cancelled",
@@ -911,6 +918,7 @@ class AgentRuntime:
             raise RuntimeError(f"Max sub-agent depth ({self._config.max_sub_agent_depth}) exceeded")
         agent_id = uuid.uuid4().hex[:12]
         session.register_sub_agent(agent_id, instructions, depth + 1,
+                                   parent_id=_caller_id,
                                    fork_from=_caller_id if fork_context else None)
         self._agent_to_session[agent_id] = session
         return agent_id

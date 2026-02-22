@@ -1,7 +1,8 @@
-"""Agent loop event types emitted by _run_turn for consumer observation.
+"""Event types emitted by Session for consumer observation.
 
-Events signal state transitions in the agent loop. They are informational —
-they do not alter control flow, interrupt logic, or the agent's return value.
+Events signal state transitions in the agent loop and sub-agent lifecycle.
+They are informational — they do not alter control flow, interrupt logic,
+or the agent's return value.
 """
 
 from __future__ import annotations
@@ -59,5 +60,29 @@ class TurnEnd:
     prompt_tokens: int
     completion_tokens: int
 
+# ── Agent tree lifecycle events ──
 
-AgentEvent = RoundStart | ModelRequest | ModelResponse | ToolExecStart | ToolExecEnd | TurnEnd
+@dataclass(frozen=True, slots=True)
+class AgentCreated:
+    """Emitted when a sub-agent is registered in the session's agent tree."""
+    agent_id: str
+    parent_id: str
+    depth: int
+
+
+@dataclass(frozen=True, slots=True)
+class TaskStarted:
+    """Emitted when a task begins on a sub-agent."""
+    agent_id: str
+    task_id: str
+    task: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCompleted:
+    """Emitted when a sub-agent task finishes."""
+    agent_id: str
+    task_id: str
+
+AgentEvent = (RoundStart | ModelRequest | ModelResponse | ToolExecStart | ToolExecEnd | TurnEnd
+            | AgentCreated | TaskStarted | TaskCompleted)

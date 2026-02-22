@@ -864,10 +864,12 @@ async def test_event_sub_agent_propagation():
       2. Sub-agent: text response (the sub-agent's _run_turn calls _llm_call)
       3. Main agent: text response (after tool execution completes)
 
-    Expected event sequence (13 events):
+    Expected event sequence (16 events):
       Main  RoundStart(0)  ModelRequest  ModelResponse(tool_calls)
       Main  ToolExecStart
+        AgentCreated(sub) TaskStarted(sub)
         Sub RoundStart(0) ModelRequest ModelResponse(no_tools) TurnEnd
+        TaskCompleted(sub)
       Main  ToolExecEnd
       Main  RoundStart(1) ModelRequest ModelResponse(no_tools) TurnEnd
     """
@@ -900,13 +902,13 @@ print(f'sub says: {result}')"""
             agent_label="main",
         )
 
-        check("event_sub_count_13", lambda: len(events) == 13, f"got {len(events)}")
+        check("event_sub_count_13", lambda: len(events) == 16, f"got {len(events)}")
         check("event_sub_return", lambda: result == "All done")
         # Identify main vs sub events
         main_events = [e for e in events if getattr(e, 'agent_id', None) == "main"]
         sub_events = [e for e in events if getattr(e, 'agent_id', None) not in ("main", None)]
         check("event_sub_main_count", lambda: len(main_events) == 9, f"main={len(main_events)}")
-        check("event_sub_sub_count", lambda: len(sub_events) == 4, f"sub={len(sub_events)}")
+        check("event_sub_sub_count", lambda: len(sub_events) == 7, f"sub={len(sub_events)}")
         # Sub-agent events should have consistent agent_id (a UUID, not "main")
         sub_ids = set(getattr(e, 'agent_id', None) for e in sub_events)
         check("event_sub_single_id", lambda: len(sub_ids) == 1 and "main" not in sub_ids,
