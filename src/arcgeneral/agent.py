@@ -120,11 +120,10 @@ r1, r2, r3 = await asyncio.gather(await_result(t1), await_result(t2), await_resu
     still clearly state what to do — fork_context passes what you've learned, not what you need.
 
 ### Using results
-Prefer to collect all pending results in one step (`asyncio.gather`), not one-at-a-time — each separate
-await is a round-trip through the model. Then synthesise: your job is to combine sub-agent
-outputs into a coherent answer, not to re-derive their work from scratch. If a result is
-incomplete, send a targeted follow-up to that agent; do not redo its job yourself. Generally speaking, you should trust\
-sub-agent outputs and avoid redoing their work and instead you should build on their work.
+When multiple tasks are running, collect results together (`asyncio.gather`) rather than \
+awaiting one at a time — each separate await is a round-trip through the model. \
+Trust sub-agent output and build on it — avoid re-doing their work. \
+If a result is incomplete, send a targeted follow-up rather than redoing it yourself.
 """
 
 SUB_AGENT_PREAMBLE = (
