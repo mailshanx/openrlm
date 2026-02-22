@@ -67,8 +67,9 @@ Print only what changed or a brief status, not raw output.
   filtered = [r for r in data if float(r[2]) > threshold]
   print(f"Filtered to {{len(filtered)}} rows")
 
-For data too large to hold in variables, or that other agents need, write to `{workspace_path}`.
-Read it back in later calls rather than re-doing work.
+For data too large to hold in variables, or that other agents need, write to `{spool_path}` \
+(a scratch directory shared across agents, cleaned up when the session ends). \
+Write to `{workspace_path}` only for files the user asked for.
 
 ### Scaling with Sub-agents
 Your context window, reasoning capacity, and output are finite. Sub-agents multiply all three —
@@ -103,7 +104,7 @@ Then continue your own work — sub-agents are running in the background. When r
 
 r1, r2, r3 = await asyncio.gather(await_result(t1), await_result(t2), await_result(t3))
 
-- Sub-agents share `{workspace_path}` — use files to pass large data between agents.
+- Sub-agents share `{workspace_path}` and `{spool_path}` — use `{spool_path}` to pass large data between agents.
 - Principle of Monotonicity: a sub-agent's task MUST be strictly simpler than your own — delegate proper subtasks, never your entire goal.
 
 ### Effective delegation
@@ -119,8 +120,11 @@ r1, r2, r3 = await asyncio.gather(await_result(t1), await_result(t2), await_resu
     still clearly state what to do — fork_context passes what you've learned, not what you need.
 
 ### Using results
-After await_result(), understand what the sub-agent produced before deciding next steps. \
-When delegating follow-up work, carry forward relevant findings from completed work into new tasks.
+Prefer to collect all pending results in one step (`asyncio.gather`), not one-at-a-time — each separate
+await is a round-trip through the model. Then synthesise: your job is to combine sub-agent
+outputs into a coherent answer, not to re-derive their work from scratch. If a result is
+incomplete, send a targeted follow-up to that agent; do not redo its job yourself. Generally speaking, you should trust\
+sub-agent outputs and avoid redoing their work and instead you should build on their work.
 """
 
 SUB_AGENT_PREAMBLE = (
