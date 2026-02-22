@@ -71,51 +71,67 @@ For data too large to hold in variables, or that other agents need, write to `{w
 Read it back in later calls rather than re-doing work.
 
 ### Scaling with Sub-agents
-You work in a loop, one code block at a time. Each code execution returns at most 2000 lines
-of output and times out after 7 minutes. Sub-agents break through these limits — each runs in
-its own environment with its own limits, working in the background while you continue:
+Your context window, reasoning capacity, and output are finite. Sub-agents multiply all three —
+each runs in its own environment with its own limits, working in the background while you
+continue. Each code execution returns at most 2000 lines of output and times out after
+7 minutes. await_result() is subject to the same 2000-line cap — but there is no limit on what
+a sub-agent writes to files. Delegate work where the sub-agent reasons and compresses, returning
+*findings* rather than raw data. A sub-agent that returns file contents verbatim is an expensive
+cat(1) — read into a Python variable and process in code instead.
 
-- agent_id = await create_agent(instructions='...') — creates a sub-agent with its own Python environment
-- task_id = await run_agent(agent_id=agent_id, task='...') — starts a task in the background, returns immediately
+Sub-agent API:
+
+- agent_id_1 = await create_agent(instructions='...') — creates a sub-agent with a blank slate
+- agent_id_2 = await create_agent(instructions='...', fork_context=True) — creates a sub-agent that inherits your conversation history
+- task_id = await run_agent(agent_id=agent_id_1, task='...') — starts a task in the background, returns immediately
 - result = await await_result(task_id) — blocks until the task finishes, returns the final response
 
 run_agent is non-blocking — the sub-agent works in the background while your code continues.
 Submit all tasks first, do your own work, then collect results across multiple steps:
 
-  a = await create_agent(instructions='citation specialist')
-  b = await create_agent(instructions='judicial historian')
-  t1 = await run_agent(agent_id=a, task='research citation percentiles')
-  t2 = await run_agent(agent_id=b, task='compile judge case histories')
+# Independent specialists — blank slate, all context in the task
+a = await create_agent(instructions='citation specialist')
+b = await create_agent(instructions='judicial historian')
+t1 = await run_agent(agent_id=a, task='research citation percentiles')
+t2 = await run_agent(agent_id=b, task='compile judge case histories')
+
+# Continuing your work — sub-agent sees your full exploration history
+c = await create_agent(instructions='coding and auth specialist', fork_context=True)
+t3 = await run_agent(agent_id=c, task='find where OAuth tokens are refreshed and how they propagate')
 
 Then continue your own work — sub-agents are running in the background. When ready:
 
-  r1, r2 = await asyncio.gather(await_result(t1), await_result(t2))
+r1, r2, r3 = await asyncio.gather(await_result(t1), await_result(t2), await_result(t3))
 
 - Sub-agents share `{workspace_path}` — use files to pass large data between agents.
 - Principle of Monotonicity: a sub-agent's task MUST be strictly simpler than your own — delegate proper subtasks, never your entire goal.
 
 ### Effective delegation
-Sub-agents start with no knowledge of your work so far. They see only their `instructions` and `task`.
-
 - **instructions** defines the agent's role. Be specific about what it should know and do.
-- **task** must be self-contained. Include what to do, what you already know that's relevant \
-(key findings, file paths, API details, constraints), and what output format you need. \
-Do not assume the sub-agent will discover or read files you have not mentioned.
-- When spawning agents that build on earlier results (yours or other sub-agents'), include \
-the relevant findings directly in the task.
+- **task** must be self-contained. Include what to do, what you already know that's relevant
+    (key findings, file paths, API details, constraints), and what output format you need.
+    Do not assume the sub-agent will discover or read files you have not mentioned.
+- When spawning agents that build on earlier results (yours or other sub-agents'), include
+    the relevant findings directly in the task.
+- **fork_context=True** gives the sub-agent your full conversation history — every file path,
+    tool output, and reasoning from your prior rounds. Use this when the sub-agent's work
+    overlaps with yours and may depend on context you can't fully anticipate. The task must
+    still clearly state what to do — fork_context passes what you've learned, not what you need.
 
 ### Using results
 After await_result(), understand what the sub-agent produced before deciding next steps. \
 When delegating follow-up work, carry forward relevant findings from completed work into new tasks.
 """
 
-SUB_AGENT_SUFFIX = (
-    "\n\n## Your Role\n"
+SUB_AGENT_PREAMBLE = (
+    "## Your Role\n"
     "You were created by another agent to accomplish a specific task. "
     "Your final text response (when you stop calling tools) is returned to your creator as the result. "
     "Be specific and structured in your output — it feeds into further work. "
     "For large results, save to disk and return the file path in your response.\n"
     "\n## Additional Instructions\n"
+    "{instructions}\n"
+    "\n## Task\n"
 )
 
 
@@ -126,6 +142,8 @@ class _SubAgent:
     depth: int
     sandbox: Sandbox | None = None
     messages: list | None = None
+    forked_messages: list | None = None
+    _first_task: bool = True  # flipped after first run_agent
     lock: asyncio.Lock = None  # serializes _run_turn calls per sub-agent
 
     def __post_init__(self):
@@ -145,7 +163,7 @@ class RuntimeServices:
     """
     llm_call: Callable[[list[dict], dict], Awaitable[CompletionResponse]]
     create_sandbox: Callable[[], Awaitable[Sandbox]]
-    build_system_message: Callable[[str | None], dict]
+    build_system_message: Callable[[], dict]
     config: AgentConfig
     spool_dir: Path
     spool_path: str  # spool path as visible from inside the sandbox
@@ -194,7 +212,7 @@ class Session:
 
         Use this when constructing your own message list for run_turn.
         """
-        return self._services.build_system_message(None)
+        return self._services.build_system_message()
 
     @property
     def messages(self) -> list[dict]:
@@ -334,12 +352,33 @@ class Session:
         sub = self._sub_agents.get(agent_id)
         return sub.depth if sub else 0
 
-    def register_sub_agent(self, agent_id: str, instructions: str, depth: int) -> None:
-        """Register a new sub-agent in this session's agent tree."""
-        logger.info("[session %s] Registered sub-agent %s (depth=%d)", self._session_id, agent_id, depth)
+    def register_sub_agent(self, agent_id: str, instructions: str, depth: int,
+                           fork_from: str | None = None) -> None:
+        """Register a new sub-agent in this session's agent tree.
+
+        Args:
+            agent_id: Unique identifier for the new sub-agent.
+            instructions: Role/instructions for the sub-agent's system prompt.
+            depth: Depth in the agent tree (parent depth + 1).
+            fork_from: If set, the agent_id whose message history
+                       should be copied into the new sub-agent. The sub-agent
+                       starts with the forked conversation context instead of
+                       a blank slate.
+        """
+        forked = None
+        if fork_from is not None:
+            if fork_from in self._sub_agents:
+                source = self._sub_agents[fork_from].messages  # may be None if sandbox not yet init
+            else:
+                source = self._messages  # root agent
+            if source is not None:
+                forked = list(source)  # snapshot
+        logger.info("[session %s] Registered sub-agent %s (depth=%d%s)", self._session_id, agent_id, depth,
+                     ", forked" if forked else "")
         self._sub_agents[agent_id] = _SubAgent(
             instructions=instructions,
             depth=depth,
+            forked_messages=forked,
         )
 
     async def start_sub_task(self, agent_id: str, task: str) -> str:
@@ -360,7 +399,12 @@ class Session:
             try:
                 async with sub.lock:
                     await self._ensure_sub_sandbox(agent_id, sub)
-                    sub.messages.append({"role": "user", "content": task})
+                    if sub._first_task:
+                        content = SUB_AGENT_PREAMBLE.format(instructions=sub.instructions) + task
+                        sub._first_task = False
+                    else:
+                        content = task
+                    sub.messages.append({"role": "user", "content": content})
                     result = await self._run_turn(
                         sub.messages, sub.sandbox,
                         agent_label=agent_id,
@@ -522,7 +566,10 @@ class Session:
         logger.info("[session %s] Creating sandbox for sub-agent %s", self._session_id, agent_id)
         sub.sandbox = await self._services.create_sandbox()
         await self._inject_agent_id(sub.sandbox, agent_id)
-        sub.messages = [self._services.build_system_message(sub.instructions)]
+        sub.messages = [self._services.build_system_message()]
+        if sub.forked_messages:
+            sub.messages.extend(msg for msg in sub.forked_messages if msg.get("role") != "system")
+            sub.forked_messages = None  # free the snapshot
         logger.info("[session %s] Sub-agent %s ready", self._session_id, agent_id)
 
     @staticmethod
@@ -532,8 +579,8 @@ class Session:
             f"_AGENT_ID = {agent_id!r}\n"
             "if 'create_agent' in dir():\n"
             "    _original_create_agent = create_agent\n"
-            "    async def create_agent(instructions):\n"
-            "        return await _original_create_agent(instructions=instructions, _caller_id=_AGENT_ID)\n"
+            "    async def create_agent(instructions, fork_context=False):\n"
+            "        return await _original_create_agent(instructions=instructions, fork_context=fork_context, _caller_id=_AGENT_ID)\n"
         )
         try:
             await sandbox.execute(code, timeout=10.0)
@@ -804,12 +851,8 @@ class AgentRuntime:
 
     # ── Infrastructure services ──
 
-    def build_system_message(self, extra_instructions: str | None = None) -> dict:
-        """Build the system message dict for root or sub-agents.
-
-        For root agents: call with no arguments.
-        For sub-agents: engine calls this internally with extra_instructions.
-        """
+    def build_system_message(self) -> dict:
+        """Build the system message dict, identical for root and sub-agents."""
         system_prompt = (
             self._config.system_prompt
             if self._config.system_prompt is not None
@@ -820,8 +863,6 @@ class AgentRuntime:
             workspace_path=self._workspace_path,
             spool_path=self._spool_path,
         )
-        if extra_instructions:
-            system_prompt += SUB_AGENT_SUFFIX + extra_instructions
         return {"role": "system", "content": system_prompt}
 
     async def _llm_call(self, messages: list, request_kwargs: dict) -> CompletionResponse:
@@ -850,11 +891,14 @@ class AgentRuntime:
     # to via the flat _agent_to_session table, then delegate to Session methods.
     # Every agent_id at every depth maps to the root Session that owns its tree.
 
-    async def _host_create_agent(self, instructions: str, _caller_id: str = "main") -> str:
+    async def _host_create_agent(self, instructions: str, fork_context: bool = False,
+                                  _caller_id: str = "main") -> str:
         """Create a sub-agent with its own Python environment.
 
         The sub-agent has the same capabilities and functions as you,
         plus any additional instructions you provide.
+        Set fork_context=True to give the sub-agent your conversation history —
+        it will see everything you've discovered and reasoned about so far.
         Returns an agent_id string to use with run_agent."""
         session = self._agent_to_session.get(_caller_id)
         if session is None:
@@ -863,7 +907,8 @@ class AgentRuntime:
         if depth >= self._config.max_sub_agent_depth:
             raise RuntimeError(f"Max sub-agent depth ({self._config.max_sub_agent_depth}) exceeded")
         agent_id = uuid.uuid4().hex[:12]
-        session.register_sub_agent(agent_id, instructions, depth + 1)
+        session.register_sub_agent(agent_id, instructions, depth + 1,
+                                   fork_from=_caller_id if fork_context else None)
         self._agent_to_session[agent_id] = session
         return agent_id
 

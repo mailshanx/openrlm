@@ -923,6 +923,139 @@ print(f'sub says: {result}')"""
                len(sub_te) == 1 and sub_te[0].rounds == 1
         )[-1])
 
+async def test_fork_context_inherits_parent_history():
+    """fork_context=True gives sub-agent the parent's message history.
+
+    Mock LLM script:
+      1. Main round 0: tool_call → code that creates sub-agent with fork_context=True,
+         runs it, and awaits result
+      2. Sub-agent round 0: text response
+      3. Main round 1: text response
+
+    After the sub-agent starts, its messages should contain:
+      [system_msg, parent_user, parent_assistant+tool, parent_tool_result, sub_task_user]
+    The system message is identical to root's (no extra_instructions appended).
+    The sub-agent's instructions appear in the first user message (task) as a preamble.
+    """
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
+
+    sub_agent_code = """aid = await create_agent(instructions='forked helper', fork_context=True)
+tid = await run_agent(agent_id=aid, task='Continue my work')
+result = await await_result(tid)
+print(f'sub says: {result}')"""
+
+    # We'll capture sub-agent messages via a side channel
+    captured_sub_messages = []
+
+    original_run_turn = Session._run_turn
+    async def spy_run_turn(self, full_history, sandbox, agent_label="main"):
+        if agent_label != "main":
+            # Capture sub-agent's initial messages before the turn runs
+            captured_sub_messages.extend(list(full_history))
+        return await original_run_turn(self, full_history, sandbox, agent_label=agent_label)
+
+    responses = [
+        _tool_resp(sub_agent_code),      # main agent round 0
+        _text_resp("I see your history"),  # sub-agent round 0
+        _text_resp("Done"),               # main agent round 1
+    ]
+    async def mock_llm(messages, request_kwargs):
+        return responses.pop(0)
+
+    async with runtime:
+        session = await runtime.create_session("test")
+        runtime._llm_call = mock_llm
+        Session._run_turn = spy_run_turn
+        try:
+            result = await session.run_single("Explore the codebase")
+        finally:
+            Session._run_turn = original_run_turn
+
+        check("fork_ctx_result", lambda: result == "Done")
+
+        # The captured messages should be the sub-agent's full_history at the start
+        # of its turn: [sub_system, parent_user, parent_assistant+tool, parent_tool_result, sub_task]
+        check("fork_ctx_has_messages", lambda: len(captured_sub_messages) >= 4,
+               f"got {len(captured_sub_messages)}")
+
+        # First message should be the system message (same as root — no instructions appended)
+        check("fork_ctx_own_system", lambda: (
+            captured_sub_messages[0].get("role") == "system"
+            and "forked helper" not in captured_sub_messages[0].get("content", "")
+        ))
+
+        # Should contain the parent's original user message
+        user_msgs = [m for m in captured_sub_messages if m.get("role") == "user"]
+        check("fork_ctx_has_parent_user", lambda: any(
+            "Explore the codebase" in m.get("content", "") for m in user_msgs
+        ))
+
+        # Should NOT contain the parent's system message (only one system msg, the sub's own)
+        system_msgs = [m for m in captured_sub_messages if m.get("role") == "system"]
+        check("fork_ctx_one_system", lambda: len(system_msgs) == 1,
+               f"got {len(system_msgs)} system messages")
+
+        # Last message should be the sub-agent's task with preamble (instructions + task)
+        check("fork_ctx_task_last", lambda: (
+            captured_sub_messages[-1].get("role") == "user"
+            and "Continue my work" in captured_sub_messages[-1].get("content", "")
+            and "forked helper" in captured_sub_messages[-1].get("content", "")
+        ))
+
+
+async def test_fork_context_default_no_history():
+    """fork_context=False (default) gives sub-agent a blank slate.
+
+    Sub-agent messages should only be [system, task] — no parent history.
+    """
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
+
+    sub_agent_code = """aid = await create_agent(instructions='blank helper')
+tid = await run_agent(agent_id=aid, task='Do something')
+result = await await_result(tid)
+print(f'sub says: {result}')"""
+
+    captured_sub_messages = []
+
+    original_run_turn = Session._run_turn
+    async def spy_run_turn(self, full_history, sandbox, agent_label="main"):
+        if agent_label != "main":
+            captured_sub_messages.extend(list(full_history))
+        return await original_run_turn(self, full_history, sandbox, agent_label=agent_label)
+
+    responses = [
+        _tool_resp(sub_agent_code),     # main agent round 0
+        _text_resp("Hello"),            # sub-agent round 0
+        _text_resp("Done"),             # main agent round 1
+    ]
+    async def mock_llm(messages, request_kwargs):
+        return responses.pop(0)
+
+    async with runtime:
+        session = await runtime.create_session("test")
+        runtime._llm_call = mock_llm
+        Session._run_turn = spy_run_turn
+        try:
+            result = await session.run_single("Explore the codebase")
+        finally:
+            Session._run_turn = original_run_turn
+
+        check("no_fork_ctx_result", lambda: result == "Done")
+
+        # Sub-agent should only have [system, task] — exactly 2 messages
+        check("no_fork_ctx_count", lambda: len(captured_sub_messages) == 2,
+               f"got {len(captured_sub_messages)}")
+        check("no_fork_ctx_system", lambda: captured_sub_messages[0].get("role") == "system")
+        check("no_fork_ctx_task", lambda: (
+            captured_sub_messages[1].get("role") == "user"
+            and "Do something" in captured_sub_messages[1].get("content", "")
+        ))
 
 # ---------------------------------------------------------------------------
 # LLM client protocol tests
@@ -1491,10 +1624,12 @@ async def test_anthropic_oauth_token_env_precedence():
 
     resolver = default_api_key_resolver()
 
-    # Both set: ANTHROPIC_OAUTH_TOKEN wins
+    # Disable auth file so we're testing env var precedence only
+    old_auth_file = os.environ.get("ARCGENERAL_AUTH_FILE")
     old_oauth = os.environ.get("ANTHROPIC_OAUTH_TOKEN")
     old_api = os.environ.get("ANTHROPIC_API_KEY")
     try:
+        os.environ["ARCGENERAL_AUTH_FILE"] = "/nonexistent/auth.json"
         os.environ["ANTHROPIC_OAUTH_TOKEN"] = "sk-ant-oat-from-oauth-env"
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-api01-from-api-env"
         key = await resolver("anthropic")
@@ -1511,6 +1646,10 @@ async def test_anthropic_oauth_token_env_precedence():
         report("non_anthropic_unaffected", key3 == "or-test-key")
     finally:
         # Restore
+        if old_auth_file is not None:
+            os.environ["ARCGENERAL_AUTH_FILE"] = old_auth_file
+        elif "ARCGENERAL_AUTH_FILE" in os.environ:
+            del os.environ["ARCGENERAL_AUTH_FILE"]
         if old_oauth is not None:
             os.environ["ANTHROPIC_OAUTH_TOKEN"] = old_oauth
         elif "ANTHROPIC_OAUTH_TOKEN" in os.environ:
@@ -2223,6 +2362,10 @@ async def main():
     await test_event_callback_error_isolation()
     await test_event_no_callback()
     await test_event_sub_agent_propagation()
+
+    print("\nFork context tests (separate runtimes, mock LLM):")
+    await test_fork_context_inherits_parent_history()
+    await test_fork_context_default_no_history()
 
     print("\nLLM client protocol tests:")
     await test_openrouter_client_converts_text_response()
