@@ -19,6 +19,7 @@ class AgentConfig:
     output_limit_lines: int = 2000
     output_limit_bytes: int = 50_000
     temperature: float | None = None
+    task_preview_chars: int = 12_000
     sandbox_binds: dict[str, str] = field(default_factory=dict)
     workspace_path: str | None = None  # resolved at runtime; shown in system prompt
     spool_path: str | None = None        # resolved at runtime; shown in system prompt

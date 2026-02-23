@@ -759,16 +759,16 @@ async def test_event_emission_two_rounds():
         messages.append({"role": "user", "content": "What is 2+2?"})
         result = await session._run_turn(
             messages, session._sandbox,
-            agent_label="main",
+            agent_label=session.root_agent_label,
         )
 
         check("event_count_9", lambda: len(events) == 9, f"got {len(events)}")
         # Round 0
-        check("event_r0_start", lambda: isinstance(events[0], RoundStart) and events[0].round_num == 0 and events[0].agent_id == "main")
-        check("event_r0_request", lambda: isinstance(events[1], ModelRequest) and events[1].agent_id == "main")
+        check("event_r0_start", lambda: isinstance(events[0], RoundStart) and events[0].round_num == 0 and events[0].agent_id == session.root_agent_label)
+        check("event_r0_request", lambda: isinstance(events[1], ModelRequest) and events[1].agent_id == session.root_agent_label)
         check("event_r0_response", lambda: isinstance(events[2], ModelResponse) and events[2].has_tool_calls and events[2].model == "test/mock")
-        check("event_tool_start", lambda: isinstance(events[3], ToolExecStart) and "print(2+2)" in events[3].code and events[3].agent_id == "main")
-        check("event_tool_end", lambda: isinstance(events[4], ToolExecEnd) and events[4].elapsed_seconds >= 0 and events[4].agent_id == "main")
+        check("event_tool_start", lambda: isinstance(events[3], ToolExecStart) and "print(2+2)" in events[3].code and events[3].agent_id == session.root_agent_label)
+        check("event_tool_end", lambda: isinstance(events[4], ToolExecEnd) and events[4].elapsed_seconds >= 0 and events[4].agent_id == session.root_agent_label)
         # Round 1
         check("event_r1_start", lambda: isinstance(events[5], RoundStart) and events[5].round_num == 1)
         check("event_r1_response", lambda: isinstance(events[7], ModelResponse) and not events[7].has_tool_calls)
@@ -798,7 +798,7 @@ async def test_event_emission_immediate():
         messages.append({"role": "user", "content": "Hi"})
         result = await session._run_turn(
             messages, session._sandbox,
-            agent_label="main",
+            agent_label=session.root_agent_label,
         )
 
         check("event_imm_count_4", lambda: len(events) == 4, f"got {len(events)}")
@@ -829,7 +829,7 @@ async def test_event_callback_error_isolation():
         messages.append({"role": "user", "content": "Test"})
         result = await session._run_turn(
             messages, session._sandbox,
-            agent_label="main",
+            agent_label=session.root_agent_label,
         )
         check("event_error_isolation", lambda: result == "Survived")
 
@@ -851,7 +851,7 @@ async def test_event_no_callback():
         messages.append({"role": "user", "content": "Test"})
         result = await session._run_turn(
             messages, session._sandbox,
-            agent_label="main",
+            agent_label=session.root_agent_label,
         )
         check("event_no_callback", lambda: result == "No events")
 
@@ -899,24 +899,25 @@ print(f'sub says: {result}')"""
         messages.append({"role": "user", "content": "Use a sub-agent"})
         result = await session._run_turn(
             messages, session._sandbox,
-            agent_label="main",
+            agent_label=session.root_agent_label,
         )
 
         check("event_sub_count_13", lambda: len(events) == 16, f"got {len(events)}")
         check("event_sub_return", lambda: result == "All done")
         # Identify main vs sub events
-        main_events = [e for e in events if getattr(e, 'agent_id', None) == "main"]
-        sub_events = [e for e in events if getattr(e, 'agent_id', None) not in ("main", None)]
+        root_label = session.root_agent_label
+        main_events = [e for e in events if getattr(e, 'agent_id', None) == root_label]
+        sub_events = [e for e in events if getattr(e, 'agent_id', None) not in (root_label, None)]
         check("event_sub_main_count", lambda: len(main_events) == 9, f"main={len(main_events)}")
         check("event_sub_sub_count", lambda: len(sub_events) == 7, f"sub={len(sub_events)}")
         # Sub-agent events should have consistent agent_id (a UUID, not "main")
         sub_ids = set(getattr(e, 'agent_id', None) for e in sub_events)
-        check("event_sub_single_id", lambda: len(sub_ids) == 1 and "main" not in sub_ids,
+        check("event_sub_single_id", lambda: len(sub_ids) == 1 and root_label not in sub_ids,
                f"sub_ids={sub_ids}")
         check("event_sub_inside_tool", lambda: (
                tool_start_idx := next((i for i, e in enumerate(events) if isinstance(e, ToolExecStart)), -1),
                tool_end_idx := next((i for i, e in enumerate(events) if isinstance(e, ToolExecEnd)), -1),
-               sub_idx := [i for i, e in enumerate(events) if getattr(e, 'agent_id', None) not in ("main", None)],
+               sub_idx := [i for i, e in enumerate(events) if getattr(e, 'agent_id', None) not in (root_label, None)],
                tool_start_idx >= 0 and tool_end_idx >= 0 and all(tool_start_idx < i < tool_end_idx for i in sub_idx)
         )[-1])
         # Sub-agent should have its own TurnEnd
@@ -935,7 +936,9 @@ async def test_fork_context_inherits_parent_history():
       3. Main round 1: text response
 
     After the sub-agent starts, its messages should contain:
-      [system_msg, parent_user, parent_assistant+tool, parent_tool_result, sub_task_user]
+      [system_msg, parent_user, sub_task_user]
+    The in-flight assistant+tool_calls from the parent's current round is
+    trimmed — it has no matching tool_result and would be invalid in an API call.
     The system message is identical to root's (no extra_instructions appended).
     The sub-agent's instructions appear in the first user message (task) as a preamble.
     """
@@ -954,7 +957,7 @@ print(f'sub says: {result}')"""
 
     original_run_turn = Session._run_turn
     async def spy_run_turn(self, full_history, sandbox, agent_label="main"):
-        if agent_label != "main":
+        if agent_label != self.root_agent_label:
             # Capture sub-agent's initial messages before the turn runs
             captured_sub_messages.extend(list(full_history))
         return await original_run_turn(self, full_history, sandbox, agent_label=agent_label)
@@ -979,8 +982,9 @@ print(f'sub says: {result}')"""
         check("fork_ctx_result", lambda: result == "Done")
 
         # The captured messages should be the sub-agent's full_history at the start
-        # of its turn: [sub_system, parent_user, parent_assistant+tool, parent_tool_result, sub_task]
-        check("fork_ctx_has_messages", lambda: len(captured_sub_messages) >= 4,
+        # of its turn: [sub_system, parent_user, sub_task_user]
+        # The parent's in-flight assistant+tool_calls is trimmed by _trim_to_complete_history.
+        check("fork_ctx_has_messages", lambda: len(captured_sub_messages) >= 3,
                f"got {len(captured_sub_messages)}")
 
         # First message should be the system message (same as root — no instructions appended)
@@ -1007,6 +1011,23 @@ print(f'sub says: {result}')"""
             and "forked helper" in captured_sub_messages[-1].get("content", "")
         ))
 
+        # The forked messages must be structurally valid (would pass API validation).
+        # The in-flight assistant+tool_calls should have been trimmed.
+        def _forked_is_valid():
+            try:
+                Session._validate_messages(captured_sub_messages)
+                return True
+            except ValueError as e:
+                return str(e)
+        check("fork_ctx_valid_structure", lambda: _forked_is_valid() is True,
+               str(_forked_is_valid()))
+
+        # No dangling assistant with tool_calls should be present before the task
+        pre_task = captured_sub_messages[:-1]  # everything before the sub-agent's task
+        check("fork_ctx_no_dangling_tool_calls", lambda: not any(
+            m.get("role") == "assistant" and "tool_calls" in m for m in pre_task
+        ))
+
 
 async def test_fork_context_default_no_history():
     """fork_context=False (default) gives sub-agent a blank slate.
@@ -1027,7 +1048,7 @@ print(f'sub says: {result}')"""
 
     original_run_turn = Session._run_turn
     async def spy_run_turn(self, full_history, sandbox, agent_label="main"):
-        if agent_label != "main":
+        if agent_label != self.root_agent_label:
             captured_sub_messages.extend(list(full_history))
         return await original_run_turn(self, full_history, sandbox, agent_label=agent_label)
 
@@ -1930,7 +1951,7 @@ async def test_sigterm_cancels_inflight_subtasks():
     # Mock _run_turn on session: for sub-agents, sleep forever to simulate long work
     cancelled = []
     async def _mock_run_turn(full_history, sandbox, agent_label=""):
-        if agent_label != "main":
+        if agent_label != session.root_agent_label:
             try:
                 await asyncio.sleep(3600)  # simulate long sub-agent work
             except asyncio.CancelledError:
@@ -2017,7 +2038,7 @@ async def test_cancellation_rolls_back_history():
         turn_task = asyncio.create_task(
             session._run_turn(
                 messages, session._sandbox,
-                agent_label="main",
+                agent_label=session.root_agent_label,
             )
         )
 
@@ -2147,7 +2168,7 @@ async def test_cancel_run_single_cleans_subtasks():
 
     cancelled_agents = []
     async def _mock_run_turn(full_history, sandbox, agent_label="main"):
-        if agent_label != "main":
+        if agent_label != session.root_agent_label:
             # Sub-agent: sleep forever until cancelled
             try:
                 await asyncio.sleep(3600)
@@ -2158,7 +2179,7 @@ async def test_cancel_run_single_cleans_subtasks():
         task = full_history[-1]["content"]
         if task == "spawn_and_hang":
             # Simulate: create_agent + run_agent via direct runtime calls
-            aid = await runtime._host_create_agent("worker", _caller_id="cli")
+            aid = await runtime._host_create_agent("worker", _caller_id=session.root_agent_label)
             await runtime._host_run_agent(aid, "do work")
             # Now hang as if awaiting result
             await asyncio.sleep(3600)

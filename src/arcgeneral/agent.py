@@ -50,9 +50,7 @@ code — never as separate tool calls.
 3. Use `asyncio.gather()` to run independent tasks concurrently within a single python tool call.
 4. The working directory `{workspace_path}` is shared with the host. Files you create or modify there are visible on the host, and vice versa.
 5. If a package is not installed, run `subprocess.run(["uv", "pip", "install", "<package>"])` to install it.
-6. To save context space, tool outputs from earlier exchanges are truncated. Your complete history \
-including all tool calls, outputs, and errors is available as `_conversation_history` — a list \
-of message dicts (role, content, and optionally tool_calls or tool_call_id), updated after each step.
+6. To save context space, tool outputs from earlier rounds are truncated in your context, but the full outputs are preserved in `_conversation_history` — a list of message dicts updated after each round.
 
 ### Python REPL
 State persists across calls — variables, imports, and function definitions all survive between tool calls.
@@ -186,12 +184,13 @@ class Session:
     """
 
     def __init__(self, services: RuntimeServices, sandbox: Sandbox, messages: list,
-                 session_id: str, on_event=None):
+                 session_id: str, on_event=None, root_agent_label: str = "main"):
         self._services = services
         self._sandbox = sandbox
         self._messages = messages
         self._session_id = session_id
         self._on_event = on_event
+        self._root_agent_label = root_agent_label
         self._sub_agents: dict[str, _SubAgent] = {}
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
@@ -200,6 +199,11 @@ class Session:
     def session_id(self) -> str:
         """The caller-provided session ID."""
         return self._session_id
+
+    @property
+    def root_agent_label(self) -> str:
+        """The label used for the root agent in events and routing."""
+        return self._root_agent_label
 
     @property
     def request_kwargs(self) -> dict:
@@ -263,7 +267,7 @@ class Session:
                 messages.pop()
                 raise
             try:
-                result = await self._run_turn(messages, self._sandbox, agent_label="main")
+                result = await self._run_turn(messages, self._sandbox, agent_label=self._root_agent_label)
                 return result
             except asyncio.CancelledError:
                 for task_id, t in list(self._running_tasks.items()):
@@ -318,6 +322,38 @@ class Session:
                 i = j
             else:
                 i += 1
+
+    @staticmethod
+    def _trim_to_complete_history(messages: list[dict]) -> list[dict]:
+        """Trim a message snapshot to the last structurally complete point.
+
+        When fork_context snapshots a live message list mid-execution, the
+        trailing assistant message (with tool_calls) may not yet have its
+        matching tool result messages.  This trims that incomplete tail so
+        the forked history is valid for an API call.
+
+        Returns the (possibly shortened) list.  Never mutates the input.
+        """
+        # Walk backwards to find the last assistant with tool_calls
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+                found_ids = set()
+                for j in range(i + 1, len(messages)):
+                    if messages[j].get("role") == "tool":
+                        found_ids.add(messages[j].get("tool_call_id"))
+                    else:
+                        break
+                if found_ids == expected_ids:
+                    return messages  # complete — no trimming needed
+                else:
+                    return messages[:i]  # drop the incomplete round
+            elif msg.get("role") == "tool":
+                continue  # skip tool results, look for their parent assistant
+            else:
+                return messages  # last non-tool message isn't a dangling assistant
+        return messages
 
     async def close(self):
         """Close this session: cancel tasks, destroy sandboxes.
@@ -378,7 +414,7 @@ class Session:
             else:
                 source = self._messages  # root agent
             if source is not None:
-                forked = list(source)  # snapshot
+                forked = self._trim_to_complete_history(list(source))
         logger.info("[session %s] Registered sub-agent %s (depth=%d, parent=%s%s)", self._session_id, agent_id, depth,
                      parent_id, ", forked" if forked else "")
         self._sub_agents[agent_id] = _SubAgent(
@@ -407,12 +443,18 @@ class Session:
             try:
                 async with sub.lock:
                     await self._ensure_sub_sandbox(agent_id, sub)
+                    limit = self._services.config.task_preview_chars
+                    if len(task) > limit:
+                        await sub.sandbox.execute(f"_task = {task!r}", timeout=10.0)
+                        visible_task = self._build_task_preview(task, limit)
+                    else:
+                        visible_task = task
                     self._emit(self._on_event, TaskStarted(agent_id=agent_id, task_id=task_id, task=task))
                     if sub._first_task:
-                        content = SUB_AGENT_PREAMBLE.format(instructions=sub.instructions) + task
+                        content = SUB_AGENT_PREAMBLE.format(instructions=sub.instructions) + visible_task
                         sub._first_task = False
                     else:
-                        content = task
+                        content = visible_task
                     sub.messages.append({"role": "user", "content": content})
                     result = await self._run_turn(
                         sub.messages, sub.sandbox,
@@ -469,7 +511,7 @@ class Session:
             checkpoint = len(full_history)
             try:
                 self._emit(on_event, RoundStart(agent_id=agent_label, round_num=round_num, max_rounds=config.max_tool_rounds))
-                compressed = self._compress_messages(full_history)
+                compressed = self._compress_messages(full_history, round_num=round_num, max_rounds=config.max_tool_rounds)
                 self._emit(on_event, ModelRequest(agent_id=agent_label))
                 response = await self._services.llm_call(compressed, request_kwargs)
 
@@ -598,6 +640,22 @@ class Session:
             logger.debug("Failed to inject agent ID %s", agent_id, exc_info=True)
 
     @staticmethod
+    def _build_task_preview(task: str, limit: int) -> str:
+        """Build a head+tail preview of a large task string."""
+        if len(task) <= limit:
+            return task
+        head = limit * 2 // 3
+        tail = limit - head
+        omitted = len(task) - head - tail
+        return (
+            f"{task[:head]}\n\n"
+            f"[... {omitted:,} characters omitted ...]\n\n"
+            f"{task[-tail:]}\n\n"
+            f"The complete task ({len(task):,} chars) is loaded in your REPL as `_task`. "
+            f"You may read sections with `print(_task[start:end])`."
+        )
+
+    @staticmethod
     async def _sync_history(sandbox: Sandbox, messages: list) -> None:
         """Push the full conversation history into the kernel as _conversation_history."""
         try:
@@ -624,8 +682,17 @@ class Session:
         return "[truncated] ...\n" + truncated
 
     @staticmethod
-    def _compress_messages(full_history: list) -> list:
-        """Compress previous turns: keep all messages but truncate tool outputs. Current turn kept in full."""
+    def _compress_messages(full_history: list, *, round_num: int | None = None,
+                           max_rounds: int | None = None) -> list:
+        """Compress previous turns and optionally annotate budget status.
+
+        Returns a new list — never mutates full_history. Tool result dicts
+        in the returned list are copies, not references to the originals.
+
+        When round_num and max_rounds are provided and fewer than 10% of
+        rounds remain, appends a <system_information> notice to the last
+        tool result in the compressed output.
+        """
         # Find the last user message — everything from there is the current turn
         last_user_idx = None
         for i in range(len(full_history) - 1, -1, -1):
@@ -643,6 +710,23 @@ class Session:
                 compressed.append(msg)
         # Current turn: everything from last user message onward
         compressed.extend(full_history[last_user_idx:])
+        # Budget awareness: annotate last tool result when rounds are running low
+        if round_num is not None and max_rounds is not None:
+            remaining = max_rounds - round_num - 1
+            threshold = int(0.1 * max_rounds)
+            if remaining < threshold:
+                for i in range(len(compressed) - 1, -1, -1):
+                    if compressed[i].get("role") == "tool":
+                        compressed[i] = {
+                            **compressed[i],
+                            "content": compressed[i].get("content", "") + (
+                                f"\n\n<system_information>\n"
+                                f"You have {remaining} llm calls remaining "
+                                f"before you exhaust your budget.\n"
+                                f"</system_information>"
+                            ),
+                        }
+                        break
         return compressed
 
     @staticmethod
@@ -803,17 +887,22 @@ class AgentRuntime:
 
     # ── Session management ──
 
-    async def create_session(self, session_id: str, *, on_event=None, context_messages: list[dict] | None = None) -> Session:
+    async def create_session(self, session_id: str, *, on_event=None, context_messages: list[dict] | None = None, root_agent_label: str | None = None) -> Session:
         """Create a new independent session with its own sandbox and message history.
 
         Args:
             session_id: Caller-provided unique identifier for this session.
             on_event: Optional callback for session events.
+            root_agent_label: Label for the root agent in events and routing (default "main-{session_id}").
             context_messages: Optional list of {"role": "user"|"assistant", "content": "..."}
                 messages to prepend as conversation history after the system prompt.
         """
         if session_id in self._sessions:
             raise ValueError(f"Session {session_id!r} already exists")
+        if root_agent_label is None:
+            root_agent_label = f"main-{session_id}"
+        if root_agent_label in self._agent_to_session:
+            raise ValueError(f"root_agent_label {root_agent_label!r} already in use")
         sandbox = await self._fork_server.create_sandbox()
         messages = [self.build_system_message()]
         if context_messages:
@@ -824,8 +913,10 @@ class AgentRuntime:
             messages=messages,
             session_id=session_id,
             on_event=on_event,
+            root_agent_label=root_agent_label,
         )
-        await Session._inject_agent_id(sandbox, session_id)
+        await Session._inject_agent_id(sandbox, session.root_agent_label)
+        self._agent_to_session[session.root_agent_label] = session
         self._agent_to_session[session_id] = session
         self._sessions[session_id] = session
         return session
@@ -855,6 +946,7 @@ class AgentRuntime:
         for agent_id in list(session._sub_agents.keys()):
             self._agent_to_session.pop(agent_id, None)
         self._agent_to_session.pop(session_id, None)
+        self._agent_to_session.pop(session.root_agent_label, None)
         self._sessions.pop(session_id, None)
         # Now close the session's own resources (tasks, sandboxes)
         await session.close()

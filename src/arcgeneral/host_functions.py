@@ -144,7 +144,7 @@ class HostFunctionServer:
 
     def __init__(self, registry: HostFunctionRegistry):
         self._registry = registry
-        self._app = web.Application()
+        self._app = web.Application(client_max_size=10 * 1024 * 1024)
         self._app.router.add_post("/call/{name}", self._handle_call)
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
