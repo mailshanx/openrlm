@@ -54,7 +54,7 @@ The fork server pre-imports expensive packages once, calls `gc.freeze()`, then f
 - **Local (default):** Fork server runs as a subprocess. No Docker required. The workspace directory defaults to cwd — files agents create appear on your filesystem.
 - **Docker:** Fork server runs inside a container for isolation. Host directories are exposed via bind mounts. Use `--image` to enable.
 
-### Harness: multi-turn state management
+### Built-in Agent Harness: multi-turn state management
 
 For multi-turn conversations, call `run_single()` repeatedly on the same session. The harness manages what accumulates between turns:
 
@@ -81,7 +81,9 @@ async with runtime:
 
 The caller provides user messages and consumes response strings. Everything else — message accumulation, compression, tool execution, history sync — happens inside the Session. Each Session is independent; multiple Sessions can run concurrently on the same Runtime.
 
-**Client-owned conversation history.** If you need to manage message history yourself — injecting context between turns, forking conversations, external history storage — use `session.run_turn(messages, user_message)` instead of `run_single`. You construct the message list starting with `session.system_message`, pass it to each turn, and freely modify it between turns. The engine borrows the list during a turn and returns it enriched. `run_single` is a convenience wrapper that uses an engine-internal list.
+**Custom Harness and Agent Implementations** 
+
+If you need to manage message history yourself — injecting context between turns, forking conversations, external history storage — use `session.run_turn(messages, user_message)` instead of `run_single`. You construct the message list starting with `session.system_message`, pass it to each turn, and freely modify it between turns. The engine borrows the list during a turn and returns it enriched. `run_single` is a convenience wrapper that uses an engine-internal list.
 
 ```python
 async with runtime:
