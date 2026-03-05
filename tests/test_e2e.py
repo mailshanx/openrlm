@@ -185,7 +185,8 @@ async def test_cli_parse_overrides():
 
 async def test_cli_functions_flag():
     """--functions flag parses into a list; _load_functions imports and calls register()."""
-    from arcgeneral.cli import parse_args, _load_functions
+    from arcgeneral.cli import parse_args
+    from arcgeneral.runtime_factory import load_functions as _load_functions
 
     # Test parsing: comma-separated modules
     original_argv = sys.argv
@@ -667,51 +668,17 @@ print(r3)
 
 
 # ---------------------------------------------------------------------------
-# Mock LLM response helpers (duck-typed to match OpenRouter SDK shapes)
+# Mock LLM response helpers
 # ---------------------------------------------------------------------------
 
-@dataclass
-class _MFn:
-    name: str
-    arguments: str
-
-@dataclass
-class _MTC:
-    id: str
-    function: _MFn
-
-@dataclass
-class _MMsg:
-    content: str | None
-    tool_calls: list | None
-
-@dataclass
-class _MUsage:
-    prompt_tokens: float
-    completion_tokens: float
-
-@dataclass
-class _MChoice:
-    message: _MMsg
-    finish_reason: str
-
-@dataclass
-class _MResp:
-    model: str
-    choices: list
-    usage: _MUsage
-
-
 _tc_counter = 0
-
 def _text_resp(text, pt=100, ct=50):
-    return _MResp("test/mock", [_MChoice(_MMsg(text, None), "stop")], _MUsage(pt, ct))
-
+    return CompletionResponse("test/mock", [CompletionChoice(CompletionMessage(text, None), "stop")], TokenUsage(pt, ct))
 def _tool_resp(code, reasoning=None, pt=100, ct=50):
     global _tc_counter
     _tc_counter += 1
-    tc = _MTC(f"call_{_tc_counter}", _MFn("python", json.dumps({"code": code})))
-    return _MResp("test/mock", [_MChoice(_MMsg(reasoning, [tc]), "tool_calls")], _MUsage(pt, ct))
+    tc = ToolCall(f"call_{_tc_counter}", ToolCallFunction("python", json.dumps({"code": code})))
+    return CompletionResponse("test/mock", [CompletionChoice(CompletionMessage(reasoning, [tc]), "tool_calls")], TokenUsage(pt, ct))
 
 def check(name, fn, detail=""):
     """Evaluate fn(); report FAIL on any exception instead of crashing."""
@@ -1088,7 +1055,7 @@ async def test_openrouter_client_converts_text_response():
     """OpenRouterClient.complete() converts SDK text response to our frozen types."""
     import unittest.mock as _mock
     client = OpenRouterClient()
-    raw_resp = _MResp("gpt-4o", [_MChoice(_MMsg("hello world", None), "stop")], _MUsage(100, 50))
+    raw_resp = CompletionResponse("gpt-4o", [CompletionChoice(CompletionMessage("hello world", None), "stop")], TokenUsage(100, 50))
     class _MockChat:
         async def send_async(self, **kw):
             return raw_resp

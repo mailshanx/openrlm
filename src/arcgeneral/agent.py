@@ -556,6 +556,8 @@ class Session:
                         }
                         for tc in msg.tool_calls
                     ]
+                if msg.provider_metadata is not None:
+                    assistant_msg["_provider_metadata"] = msg.provider_metadata
                 full_history.append(assistant_msg)
 
                 if not msg.tool_calls:

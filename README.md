@@ -25,17 +25,10 @@ The core takes a single message and runs a complete LLM↔REPL loop: the LLM emi
 
 ```python
 import asyncio
-from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
-from arcgeneral import OpenRouterClient, default_api_key_resolver
+from arcgeneral import build_runtime
 
 async def main():
-    resolver = default_api_key_resolver()
-    config = AgentConfig(
-        model="openai/gpt-5.2",
-        get_api_key=lambda: resolver("openrouter"),
-    )
-    registry = HostFunctionRegistry()
-    runtime = AgentRuntime(config, registry, llm_client=OpenRouterClient())
+    runtime = build_runtime(model="openai/gpt-5.2")
 
     async with runtime:
         session = await runtime.create_session("my-session")
@@ -161,14 +154,68 @@ arcgeneral --context history.json "continue the analysis"
 ```
 
 ### Library
-See the [Architecture](#architecture) section for single-shot and multi-turn library usage examples.
+`build_runtime()` is the main entry point for programmatic use. It handles LLM client selection, API key resolution, and host function loading — the same wiring the CLI does internally. Its keyword arguments correspond to the CLI flags:
+
+```python
+import asyncio
+from arcgeneral import build_runtime
+
+async def main():
+    runtime = build_runtime(
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        functions=["./my-tools"],
+    )
+
+    async with runtime:
+        session = await runtime.create_session("s1", on_event=my_handler)
+        result = await session.run_single("analyze this dataset")
+        print(result)
+
+        # Same session, same REPL state — variables from turn 1 persist
+        result = await session.run_single("now visualize the outliers")
+        print(result)
+
+        await runtime.close_session("s1")
+
+asyncio.run(main())
+```
+
+When you need more control — a custom `LLMClient` implementation, programmatic host function registration, or non-default `AgentConfig` settings — construct the `AgentRuntime` directly:
+
+```python
+from arcgeneral import (
+    AgentRuntime, AgentConfig, HostFunctionRegistry,
+    AnthropicClient, default_api_key_resolver,
+)
+
+registry = HostFunctionRegistry()
+registry.register("my_tool", my_async_function)
+
+resolver = default_api_key_resolver()
+config = AgentConfig(
+    model="claude-sonnet-4-5-20250514",
+    get_api_key=lambda: resolver("anthropic"),
+    max_tool_rounds=100,
+    max_sub_agent_depth=5,
+)
+
+runtime = AgentRuntime(config, registry, llm_client=AnthropicClient())
+```
+
+This is what `build_runtime` does internally. See the [LLM Client](#llm-client) section for implementing custom providers.
 
 ### Custom Host Functions
 Define tools that execute on the host but appear as regular async functions inside the agent's REPL.
 
 #### Library usage
+For functions loaded from module files, `build_runtime` handles registration:
 
-When using arcgeneral as a library, you create a `HostFunctionRegistry`, register functions on it, and pass it to `AgentRuntime`:
+```python
+runtime = build_runtime(functions=["my_tools.py", "./more-tools/"])
+```
+
+For programmatic registration (e.g., closures that capture application state), create the registry directly:
 
 ```python
 import json
@@ -300,6 +347,8 @@ The maximum recursion depth is configurable (default: 10 levels).
 
 ### `AgentConfig`
 
+`build_runtime()` constructs an `AgentConfig` internally from its keyword arguments. Direct `AgentConfig` construction is only needed when building the `AgentRuntime` manually.
+
 | Parameter | Default | Description |
 |---|---|---|
 | `model` | `"openai/gpt-5.2"` | Model identifier |
@@ -313,6 +362,7 @@ The maximum recursion depth is configurable (default: 10 levels).
 | `system_prompt` | `None` | Override the default system prompt (format string with `{functions_json}`, `{workspace_path}`, `{spool_path}` placeholders) |
 | `get_api_key` | `None` | `Callable[[], Awaitable[str]]` that returns an API key; required when using `AgentRuntime` |
 | `sandbox_binds` | `{}` | Host-to-container directory mounts (Docker mode) |
+| `task_preview_chars` | `12000` | Max characters of a sub-agent task shown in system prompt previews |
 
 ### API Key Resolution
 
@@ -330,6 +380,7 @@ The maximum recursion depth is configurable (default: 10 levels).
 | `groq` | `GROQ_API_KEY` |
 | `xai` | `XAI_API_KEY` |
 | `mistral` | `MISTRAL_API_KEY` |
+| `openai-codex` | `OPENAI_CODEX_TOKEN` |
 
 A `.env` file in the current directory is loaded automatically.
 
@@ -358,6 +409,8 @@ options:
   --log-file PATH         Log file path (default: ~/Downloads/arcgeneral.log)
   --build-image [TAG]   Build Docker sandbox image and exit (default: arcgeneral:sandbox)
   --sandbox-deps FILE   Dependencies file for --build-image (default: sandbox-deps.txt)
+  --reasoning-effort E  Reasoning effort for Codex models: none, minimal, low, medium, high, xhigh (default: medium)
+  --text-verbosity V    Text verbosity for Codex models: low, medium, high (default: medium)
 ```
 
 #### `--context FILE`
@@ -408,29 +461,12 @@ arcgeneral --functions ./contrib "search for recent papers on transformer effici
 ## LLM Client
 
 arcgeneral ships with two bundled client implementations:
-
 - **OpenRouterClient** — routes to models from OpenAI, Anthropic, Google, and others through a single API.
 - **AnthropicClient** — calls the Anthropic API directly.
 
-The caller constructs the client and passes it to `AgentRuntime`:
+`build_runtime(provider="anthropic")` or `build_runtime(provider="openrouter")` selects the appropriate client automatically. Manual client construction is only needed for custom `LLMClient` implementations.
 
-```python
-from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
-from arcgeneral import OpenRouterClient, AnthropicClient, default_api_key_resolver
-
-resolver = default_api_key_resolver()
-
-# OpenRouter — model names are provider-prefixed
-config = AgentConfig(model="openai/gpt-5.2", get_api_key=lambda: resolver("openrouter"))
-runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=OpenRouterClient())
-
-# Anthropic — bare model names
-config = AgentConfig(model="claude-sonnet-4-5-20250514", get_api_key=lambda: resolver("anthropic"))
-runtime = AgentRuntime(config, HostFunctionRegistry(), llm_client=AnthropicClient())
-```
-Both manage HTTP connection pools internally and clean up when the runtime exits.
-
-For other providers, implement the `LLMClient` protocol and inject it:
+To implement a custom provider:
 
 ```python
 from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry

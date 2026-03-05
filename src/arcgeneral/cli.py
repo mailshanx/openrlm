@@ -1,7 +1,5 @@
 import argparse
 import asyncio
-import importlib
-import importlib.util
 import json
 import dataclasses
 import sys
@@ -11,80 +9,8 @@ import textwrap
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-from arcgeneral.config import AgentConfig
-from arcgeneral.host_functions import HostFunctionRegistry
 from arcgeneral.sandbox import cleanup_orphaned_containers
-from arcgeneral.agent import AgentRuntime
-from arcgeneral.llm import (
-    OpenRouterClient,
-    AnthropicClient,
-    default_api_key_resolver,
-)
-
-
-def _load_module_from_file(filepath: Path) -> object:
-    """Load a Python module from a file path."""
-    spec = importlib.util.spec_from_file_location(filepath.stem, filepath)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"Error: could not load {filepath}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _register_module(registry: HostFunctionRegistry, module: object, source: str) -> None:
-    """Call register(registry) on a loaded module, or raise SystemExit."""
-    register_fn = getattr(module, "register", None)
-    if register_fn is None:
-        raise SystemExit(
-            f"Error: {source} has no register() function. "
-            f"Expected: def register(registry: HostFunctionRegistry) -> None"
-        )
-    register_fn(registry)
-
-
-def _load_functions(registry: HostFunctionRegistry, specs: list[str]) -> None:
-    """Load custom functions from file paths, directories, or dotted module names.
-
-    Each spec is one of:
-      - A directory path  → load all .py files in it that have register()
-      - A .py file path   → load that file
-      - A dotted name     → importlib.import_module()
-    """
-    for spec in specs:
-        p = Path(spec).expanduser()
-        if p.is_dir():
-            py_files = sorted(p.glob("*.py"))
-            if not py_files:
-                raise SystemExit(f"Error: no .py files found in {p}")
-            for f in py_files:
-                if f.name.startswith("_"):
-                    continue
-                module = _load_module_from_file(f)
-                if hasattr(module, "register"):
-                    _register_module(registry, module, str(f))
-        elif p.is_file() or spec.endswith(".py"):
-            if not p.is_file():
-                raise SystemExit(f"Error: file not found: {spec}")
-            module = _load_module_from_file(p)
-            _register_module(registry, module, spec)
-        else:
-            # Dotted module name — standard import
-            try:
-                module = importlib.import_module(spec)
-            except ImportError as e:
-                raise SystemExit(
-                    f"Error: could not import function module {spec!r}: {e}\n"
-                    f"Hint: if installed via 'uv tool', re-install with: "
-                    f"uv tool install arcgeneral --with <package>"
-                ) from e
-            _register_module(registry, module, spec)
-
-def _build_llm_client(provider: str):
-    if provider == "anthropic":
-        return AnthropicClient()
-    else:
-        return OpenRouterClient()
+from arcgeneral.runtime_factory import build_runtime
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default="openai/gpt-5.2",
                         help="Model identifier (default: %(default)s)")
     parser.add_argument("--provider", type=str, default="openrouter",
-                        help="LLM provider: 'openrouter' (default, routes to any model) or 'anthropic' (direct Anthropic API). Other providers route through OpenRouter.")
+                        help="LLM provider: 'openrouter' (default), 'anthropic' (direct Anthropic API), or 'openai-codex' (Codex via ChatGPT). Other providers route through OpenRouter.")
     parser.add_argument("--image", type=str, default=None,
                         help="Docker image tag for sandbox (omit for local mode)")
     parser.add_argument("--timeout", type=float, default=3600.0,
@@ -161,6 +87,13 @@ def parse_args() -> argparse.Namespace:
                         help="Build the Docker sandbox image and exit (default tag: arcgeneral:sandbox)")
     parser.add_argument("--sandbox-deps", type=str, default=None, metavar="FILE",
                         help="Dependencies file for --build-image (default: sandbox-deps.txt if it exists)")
+    # Codex-specific options (only used when --provider openai-codex)
+    parser.add_argument("--reasoning-effort", type=str, default="medium",
+                        choices=["none", "minimal", "low", "medium", "high", "xhigh"],
+                        help="Reasoning effort for Codex models (default: %(default)s)")
+    parser.add_argument("--text-verbosity", type=str, default="medium",
+                        choices=["low", "medium", "high"],
+                        help="Text verbosity for Codex models (default: %(default)s)")
     return parser.parse_args()
 
 
@@ -197,11 +130,6 @@ def main():
 
     load_dotenv(args.env_file)
 
-    registry = HostFunctionRegistry()
-    if args.functions:
-        modules = [m.strip() for m in args.functions.split(",") if m.strip()]
-        _load_functions(registry, modules)
-
     # Load conversation context if provided
     context_messages: list[dict] | None = None
     if args.context:
@@ -222,19 +150,17 @@ def main():
                 raise SystemExit(f"Error: context message {i} has invalid role {msg['role']!r} (expected user or assistant)")
         context_messages = raw
 
-    resolver = default_api_key_resolver()
-    config = AgentConfig(
+    runtime = build_runtime(
         model=args.model,
-        get_api_key=lambda: resolver(args.provider),
-        sandbox_image=args.image,  # None = local mode
-        code_timeout=args.timeout,
-        max_tool_rounds=args.max_rounds,
-        sandbox_binds={str(Path(args.workspace).resolve() if args.workspace else Path.cwd()): "workspace"},
+        provider=args.provider,
+        image=args.image,
+        timeout=args.timeout,
+        max_rounds=args.max_rounds,
+        workspace=args.workspace,
+        functions=[m.strip() for m in args.functions.split(",") if m.strip()] if args.functions else None,
+        reasoning_effort=args.reasoning_effort,
+        text_verbosity=args.text_verbosity,
     )
-
-    llm_client = _build_llm_client(args.provider)
-    # create_agent/run_agent are registered by AgentRuntime.__init__
-    runtime = AgentRuntime(config, registry, llm_client=llm_client)
 
     if args.message is None and args.json:
         raise SystemExit("Error: --json requires a message argument (not interactive mode)")

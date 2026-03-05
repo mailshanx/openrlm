@@ -28,6 +28,7 @@ class ToolCall:
 class CompletionMessage:
     content: str | None
     tool_calls: list[ToolCall] | None
+    provider_metadata: list[dict] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,7 @@ PROVIDER_ENV_VARS: dict[str, str] = {
     "groq":         "GROQ_API_KEY",
     "xai":          "XAI_API_KEY",
     "mistral":      "MISTRAL_API_KEY",
+    "openai-codex": "OPENAI_CODEX_TOKEN",
 }
 
 _DEFAULT_AUTH_FILE = Path.home() / ".arcgeneral" / "auth.json"
