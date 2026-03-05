@@ -1,4 +1,4 @@
-"""Event types emitted by Session for consumer observation.
+"""Event types and dispatch utilities for consumer observation.
 
 Events signal state transitions in the agent loop and sub-agent lifecycle.
 They are informational — they do not alter control flow, interrupt logic,
@@ -6,6 +6,9 @@ or the agent's return value.
 """
 
 from __future__ import annotations
+import asyncio
+import logging
+from typing import Callable
 
 from dataclasses import dataclass
 
@@ -86,3 +89,100 @@ class TaskCompleted:
 
 AgentEvent = (RoundStart | ModelRequest | ModelResponse | ToolExecStart | ToolExecEnd | TurnEnd
             | AgentCreated | TaskStarted | TaskCompleted)
+
+EventCallback = Callable[[AgentEvent], None]
+"""Sync callback signature for event consumers."""
+
+
+logger = logging.getLogger(__name__)
+
+
+class EventBus:
+    """Fan-out dispatcher for agent events.
+
+    Presents a single sync callback to the engine via :meth:`callback`.
+    Distributes events to an arbitrary number of sync listeners and
+    async :class:`EventStream` consumers.
+    """
+
+    def __init__(self) -> None:
+        self._listeners: list[EventCallback] = []
+        self._streams: list[asyncio.Queue[AgentEvent | None]] = []
+
+    def callback(self, event: AgentEvent) -> None:
+        """Sync callback passed as *on_event* to :class:`Session`.
+
+        Dispatches *event* to every registered listener and stream.
+        Errors in individual listeners are swallowed with a debug log.
+        Full queues cause the event to be dropped for that stream.
+        """
+        for listener in self._listeners:
+            try:
+                listener(event)
+            except Exception:
+                logger.debug("EventBus listener error", exc_info=True)
+        for q in self._streams:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.debug("EventStream queue full, dropping event")
+
+    def add_listener(self, fn: EventCallback) -> None:
+        """Register a sync callback invoked for every event."""
+        self._listeners.append(fn)
+
+    def remove_listener(self, fn: EventCallback) -> None:
+        """Remove a previously registered sync callback.
+
+        Raises ValueError if *fn* was never added.
+        """
+        self._listeners.remove(fn)
+
+    def stream(self, maxsize: int = 0) -> EventStream:
+        """Create an async iterator over events.
+
+        Each stream gets its own queue with independent backpressure
+        and consumption rate.  The engine never blocks.
+        """
+        q: asyncio.Queue[AgentEvent | None] = asyncio.Queue(maxsize=maxsize)
+        self._streams.append(q)
+        return EventStream(q, self)
+
+    def close(self) -> None:
+        """Signal all streams to stop iterating.  Idempotent."""
+        for q in self._streams:
+            try:
+                q.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
+
+class EventStream:
+    """Async iterator over events from an :class:`EventBus`.
+
+    Created by :meth:`EventBus.stream`.  Supports ``async for event in stream``.
+    """
+
+    def __init__(self, queue: asyncio.Queue[AgentEvent | None], bus: EventBus) -> None:
+        self._queue = queue
+        self._bus = bus
+
+    def __aiter__(self) -> EventStream:
+        return self
+
+    async def __anext__(self) -> AgentEvent:
+        event = await self._queue.get()
+        if event is None:
+            raise StopAsyncIteration
+        return event
+
+    def close(self) -> None:
+        """Detach this stream from its bus and stop iteration."""
+        try:
+            self._bus._streams.remove(self._queue)
+        except ValueError:
+            pass
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass

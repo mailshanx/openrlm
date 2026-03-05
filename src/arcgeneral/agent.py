@@ -15,8 +15,9 @@ from arcgeneral.config import AgentConfig
 from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
 from arcgeneral.sandbox import ForkServer, LocalForkServer, Sandbox
 from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
-from arcgeneral.events import (AgentEvent, RoundStart, ModelRequest, ModelResponse, ToolExecStart,
-                               ToolExecEnd, TurnEnd, AgentCreated, TaskStarted, TaskCompleted)
+from arcgeneral.events import (AgentEvent, EventCallback, RoundStart, ModelRequest, ModelResponse,
+                               ToolExecStart, ToolExecEnd, TurnEnd, AgentCreated, TaskStarted,
+                               TaskCompleted)
 
 
 logger = logging.getLogger(__name__)
@@ -184,7 +185,7 @@ class Session:
     """
 
     def __init__(self, services: RuntimeServices, sandbox: Sandbox, messages: list,
-                 session_id: str, on_event=None, root_agent_label: str = "main"):
+                 session_id: str, on_event: EventCallback | None = None, root_agent_label: str = "main"):
         self._services = services
         self._sandbox = sandbox
         self._messages = messages
@@ -732,7 +733,7 @@ class Session:
         return compressed
 
     @staticmethod
-    def _emit(on_event, event: AgentEvent) -> None:
+    def _emit(on_event: EventCallback | None, event: AgentEvent) -> None:
         """Fire an event to the consumer callback, silently ignoring errors."""
         if on_event is not None:
             try:
@@ -889,7 +890,7 @@ class AgentRuntime:
 
     # ── Session management ──
 
-    async def create_session(self, session_id: str, *, on_event=None, context_messages: list[dict] | None = None, root_agent_label: str | None = None) -> Session:
+    async def create_session(self, session_id: str, *, on_event: EventCallback | None = None, context_messages: list[dict] | None = None, root_agent_label: str | None = None) -> Session:
         """Create a new independent session with its own sandbox and message history.
 
         Args:

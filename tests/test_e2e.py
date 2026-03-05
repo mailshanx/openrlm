@@ -23,6 +23,7 @@ from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
 from arcgeneral.host_functions import HostFunctionRegistry
 from arcgeneral.agent import AgentRuntime, Session
 from arcgeneral.events import (
+    AgentEvent, EventCallback, EventBus, EventStream,
     RoundStart, ModelRequest, ModelResponse,
     ToolExecStart, ToolExecEnd, TurnEnd,
 )
@@ -893,6 +894,133 @@ print(f'sub says: {result}')"""
                len(sub_te) == 1 and sub_te[0].rounds == 1
         )[-1])
 
+# ---------------------------------------------------------------------------
+# EventBus / EventStream tests
+# ---------------------------------------------------------------------------
+
+async def test_event_bus_multi_listener():
+    """EventBus dispatches events to multiple sync listeners independently."""
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
+
+    async def mock_llm(messages, request_kwargs):
+        return _text_resp("Hello")
+
+    async with runtime:
+        list_a: list[AgentEvent] = []
+        list_b: list[AgentEvent] = []
+        bus = EventBus()
+        bus.add_listener(list_a.append)
+        bus.add_listener(list_b.append)
+        session = await runtime.create_session("test", on_event=bus.callback)
+        runtime._llm_call = mock_llm
+        result = await session.run_single("Hi")
+
+        check("bus_multi_a", lambda: len(list_a) == 4, f"a={len(list_a)}")
+        check("bus_multi_b", lambda: len(list_b) == 4, f"b={len(list_b)}")
+        check("bus_multi_identical", lambda: list_a == list_b)
+        check("bus_multi_result", lambda: result == "Hello")
+
+
+async def test_event_bus_listener_error_isolation():
+    """A throwing listener does not prevent other listeners from receiving events."""
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
+
+    async def mock_llm(messages, request_kwargs):
+        return _text_resp("Survived")
+
+    async with runtime:
+        good_events: list[AgentEvent] = []
+        bus = EventBus()
+        def _exploding_listener(e): raise ValueError("boom")
+        bus.add_listener(_exploding_listener)  # throws
+        bus.add_listener(good_events.append)  # should still work
+        session = await runtime.create_session("test", on_event=bus.callback)
+        runtime._llm_call = mock_llm
+        result = await session.run_single("Test")
+
+        check("bus_error_isolation_events", lambda: len(good_events) == 4, f"got {len(good_events)}")
+        check("bus_error_isolation_result", lambda: result == "Survived")
+
+
+async def test_event_stream_async():
+    """EventStream delivers events via async iteration."""
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
+
+    async def mock_llm(messages, request_kwargs):
+        return _text_resp("Streamed")
+
+    async with runtime:
+        bus = EventBus()
+        stream = bus.stream()
+        session = await runtime.create_session("test", on_event=bus.callback)
+        runtime._llm_call = mock_llm
+
+        # Run turn in background, then consume stream
+        turn_task = asyncio.create_task(session.run_single("Go"))
+        collected: list[AgentEvent] = []
+
+        async def consume():
+            async for event in stream:
+                collected.append(event)
+
+        # Wait for the turn to finish, then close the bus to end iteration
+        result = await turn_task
+        bus.close()
+        await consume()
+
+        check("stream_async_count", lambda: len(collected) == 4, f"got {len(collected)}")
+        check("stream_async_types", lambda: isinstance(collected[0], RoundStart))
+        check("stream_async_result", lambda: result == "Streamed")
+
+
+async def test_event_stream_close():
+    """Closing a stream before any events terminates async iteration immediately."""
+
+    bus = EventBus()
+    stream = bus.stream()
+    stream.close()
+
+    collected: list[AgentEvent] = []
+    async for event in stream:
+        collected.append(event)
+
+    check("stream_close_empty", lambda: len(collected) == 0)
+    check("stream_close_detached", lambda: len(bus._streams) == 0)
+
+
+async def test_event_bus_queue_full():
+    """A full stream queue drops events without blocking the engine or other listeners."""
+
+    config = AgentConfig(model="test/model", sandbox_image=TAG, get_api_key=_test_api_key)
+    registry = HostFunctionRegistry()
+    runtime = AgentRuntime(config, registry, llm_client=_NullClient())
+
+    async def mock_llm(messages, request_kwargs):
+        return _text_resp("Done")
+
+    async with runtime:
+        sync_events: list[AgentEvent] = []
+        bus = EventBus()
+        bus.add_listener(sync_events.append)
+        stream = bus.stream(maxsize=1)  # will overflow
+        session = await runtime.create_session("test", on_event=bus.callback)
+        runtime._llm_call = mock_llm
+        result = await session.run_single("Go")
+
+        # Sync listener got all 4 events regardless of stream overflow
+        check("bus_full_sync_count", lambda: len(sync_events) == 4, f"got {len(sync_events)}")
+        check("bus_full_result", lambda: result == "Done")
+        # Stream got at most 1 (queue was never drained)
+        check("bus_full_stream_limited", lambda: stream._queue.qsize() <= 1)
 async def test_fork_context_inherits_parent_history():
     """fork_context=True gives sub-agent the parent's message history.
 
@@ -2352,6 +2480,13 @@ async def main():
     await test_event_callback_error_isolation()
     await test_event_no_callback()
     await test_event_sub_agent_propagation()
+
+    print("\nEventBus / EventStream tests:")
+    await test_event_bus_multi_listener()
+    await test_event_bus_listener_error_isolation()
+    await test_event_stream_async()
+    await test_event_stream_close()
+    await test_event_bus_queue_full()
 
     print("\nFork context tests (separate runtimes, mock LLM):")
     await test_fork_context_inherits_parent_history()

@@ -170,10 +170,13 @@ def main():
                 await cleanup_orphaned_containers()
             on_event = None
             if args.json:
-                def on_event(event):
-                    line = json.dumps({"type": type(event).__name__, **dataclasses.asdict(event)})
-                    sys.stderr.write(line + "\n")
-                    sys.stderr.flush()
+                from arcgeneral.events import EventBus
+                bus = EventBus()
+                bus.add_listener(lambda event: (
+                    sys.stderr.write(json.dumps({"type": type(event).__name__, **dataclasses.asdict(event)}) + "\n"),
+                    sys.stderr.flush(),
+                ))
+                on_event = bus.callback
             async with runtime:
                 session = await runtime.create_session("cli", on_event=on_event, context_messages=context_messages)
                 result = await session.run_single(args.message)

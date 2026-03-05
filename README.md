@@ -286,10 +286,8 @@ arcgeneral --functions my_package.tools "do something"
 Monitor agent activity with event callbacks. Events from sub-agents at any depth flow through the same callback, distinguished by `agent_id`:
 
 ```python
-from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
-from arcgeneral.events import (
-    RoundStart, ModelResponse, ToolExecStart, ToolExecEnd, TurnEnd,
-)
+from arcgeneral import build_runtime, EventCallback
+from arcgeneral.events import RoundStart, ToolExecEnd, TurnEnd
 
 def on_event(event):
     match event:
@@ -304,6 +302,32 @@ async with runtime:
     session = await runtime.create_session("s1", on_event=on_event)
     await session.run_single("analyze this dataset")
 ```
+
+The `on_event` parameter accepts any `EventCallback` (`Callable[[AgentEvent], None]`). For multiple consumers or async I/O, use `EventBus`:
+
+```python
+from arcgeneral import EventBus
+
+bus = EventBus()
+bus.add_listener(tui.update_panel)       # sync: immediate UI update
+bus.add_listener(metrics.record_event)   # sync: bookkeeping
+
+# Async consumers get an independent stream
+stream = bus.stream(maxsize=256)
+
+session = await runtime.create_session("s1", on_event=bus.callback)
+
+# Consume asynchronously in a background task
+async def push_events():
+    async for event in stream:
+        await websocket.send(serialize(event))
+asyncio.create_task(push_events())
+
+result = await session.run_single("analyze data")
+bus.close()  # terminates async iteration
+```
+
+Each listener and stream is independent — a slow or failing consumer does not affect the engine or other consumers.
 
 ## Sub-agents
 
