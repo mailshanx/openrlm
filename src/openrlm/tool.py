@@ -2,7 +2,7 @@ import json
 import uuid
 from pathlib import Path
 
-from arcgeneral.sandbox import Sandbox
+from openrlm.sandbox import Sandbox
 
 
 PYTHON_TOOL_SCHEMA = {

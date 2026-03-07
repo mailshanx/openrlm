@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from arcgeneral.host_functions import HostFunctionRegistry
+    from openrlm.host_functions import HostFunctionRegistry
 
 
 @dataclass

@@ -1,4 +1,4 @@
-"""Build the arcgeneral sandbox Docker image."""
+"""Build the openrlm sandbox Docker image."""
 
 import subprocess
 import tempfile

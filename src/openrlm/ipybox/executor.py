@@ -26,7 +26,7 @@ _DISCONNECT = object()
 
 
 class ForkServerClient:
-    """Client for the arcgeneral fork server.
+    """Client for the openrlm fork server.
 
     Speaks length-prefixed JSON over TCP. Multiplexes multiple agents
     over a single persistent data connection.

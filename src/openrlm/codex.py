@@ -3,7 +3,7 @@
 Implements LLMClient for OpenAI Codex models (gpt-5.1, gpt-5.2, gpt-5.3 and
 their codex-mini/max/spark variants) accessed via the ChatGPT backend API.
 
-Translates between arcgeneral's internal Chat Completions message format and
+Translates between openrlm's internal Chat Completions message format and
 the Responses API wire format.  Captures reasoning blocks, message IDs, and
 tool call ID pairs as provider_metadata for verbatim replay on subsequent
 rounds (required for prompt caching and conversation consistency).
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from arcgeneral.llm import (
+from openrlm.llm import (
     CompletionChoice,
     CompletionMessage,
     CompletionResponse,
@@ -199,8 +199,8 @@ class CodexClient:
             "Authorization": f"Bearer {token}",
             "chatgpt-account-id": account_id,
             "OpenAI-Beta": "responses=experimental",
-            "originator": "arcgeneral",
-            "User-Agent": f"arcgeneral ({system} {release}; {arch})",
+            "originator": "openrlm",
+            "User-Agent": f"openrlm ({system} {release}; {arch})",
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
         }

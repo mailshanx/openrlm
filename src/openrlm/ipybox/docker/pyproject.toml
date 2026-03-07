@@ -1,7 +1,7 @@
 [project]
-name = "arcgeneral-sandbox"
+name = "openrlm-sandbox"
 version = "0.1.0"
-description = "Sandbox kernel for arcgeneral"
+description = "Sandbox kernel for openrlm"
 requires-python = ">=3.11,<3.15"
 dependencies = [{dependencies}
 ]

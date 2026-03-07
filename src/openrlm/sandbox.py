@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Callable, Awaitable, Self
 
 import aiodocker
-from arcgeneral.ipybox import ForkServerClient, ExecutionContainer, ExecutionError
-from arcgeneral.host_functions import HostFunctionServer
+from openrlm.ipybox import ForkServerClient, ExecutionContainer, ExecutionError
+from openrlm.host_functions import HostFunctionServer
 
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ class _Container(ExecutionContainer):
         ctrl_port_key = "8889/tcp"
         config = {
             "Image": self.tag,
-            "Labels": {"arcgeneral": "true"},
+            "Labels": {"openrlm": "true"},
             "HostConfig": {
                 "CapAdd": ["NET_ADMIN", "NET_RAW"],
                 "PortBindings": {
@@ -90,7 +90,7 @@ class ForkServer:
 
     def __init__(
         self,
-        tag: str = "arcgeneral:sandbox",
+        tag: str = "openrlm:sandbox",
         binds: dict[str, str] | None = None,
         host_function_server: HostFunctionServer | None = None,
     ):
@@ -189,9 +189,9 @@ class LocalForkServer:
         kernel_path = str(Path(__file__).parent / "ipybox" / "kernel.py")
 
         env = dict(os.environ)
-        env["ARCGENERAL_DATA_PORT"] = str(data_port)
-        env["ARCGENERAL_CONTROL_PORT"] = str(control_port)
-        env["ARCGENERAL_BIND_HOST"] = "127.0.0.1"
+        env["OPENRLM_DATA_PORT"] = str(data_port)
+        env["OPENRLM_CONTROL_PORT"] = str(control_port)
+        env["OPENRLM_BIND_HOST"] = "127.0.0.1"
 
         self._process = subprocess.Popen(
             [sys.executable, kernel_path],
@@ -341,12 +341,12 @@ class Sandbox:
 
 
 async def cleanup_orphaned_containers():
-    """Kill and remove any containers from previous arcgeneral runs."""
+    """Kill and remove any containers from previous openrlm runs."""
     try:
         docker = aiodocker.Docker()
         containers = await docker.containers.list(
             all=True,
-            filters={"label": ["arcgeneral=true"]},
+            filters={"label": ["openrlm=true"]},
         )
         for c in containers:
             info = await c.show()

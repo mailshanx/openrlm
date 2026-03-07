@@ -9,8 +9,8 @@ import textwrap
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-from arcgeneral.sandbox import cleanup_orphaned_containers
-from arcgeneral.runtime_factory import build_runtime
+from openrlm.sandbox import cleanup_orphaned_containers
+from openrlm.runtime_factory import build_runtime
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,14 +34,14 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
-              arcgeneral "summarize this repo"
-              arcgeneral --provider anthropic --model claude-sonnet-4-5 "explain main.py"
-              arcgeneral --functions ./my-tools "use my_search to find X"
-              arcgeneral --functions ./contrib "search for X"
-              arcgeneral --context history.json "continue the analysis"
-              arcgeneral --json "compute pi" | jq .result
-              arcgeneral --image arcgeneral:sandbox "analyze data"  # Docker mode
-              arcgeneral  # interactive session
+              openrlm "summarize this repo"
+              openrlm --provider anthropic --model claude-sonnet-4-5 "explain main.py"
+              openrlm --functions ./my-tools "use my_search to find X"
+              openrlm --functions ./contrib "search for X"
+              openrlm --context history.json "continue the analysis"
+              openrlm --json "compute pi" | jq .result
+              openrlm --image openrlm:sandbox "analyze data"  # Docker mode
+              openrlm  # interactive session
             environment:
               API keys are read from provider-specific environment variables:
                 openrouter   -> OPENROUTER_API_KEY (default)
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", type=str, default=None,
                         help="Working directory shared with agents (default: cwd)")
     parser.add_argument("--log-file", type=str,
-                        default=str(Path.home() / "Downloads" / "arcgeneral.log"),
+                        default=str(Path.home() / "Downloads" / "openrlm.log"),
                         help="Log file path (default: %(default)s)")
     parser.add_argument("--functions", type=str, default=None,
                         metavar="PATH",
@@ -82,9 +82,9 @@ def parse_args() -> argparse.Namespace:
                              '(array of {"role": "user"|"assistant", "content": "..."})')
     parser.add_argument("--json", action="store_true",
                         help="Output result as JSON on stdout; stream agent events as JSONL on stderr")
-    parser.add_argument("--build-image", type=str, nargs="?", const="arcgeneral:sandbox",
+    parser.add_argument("--build-image", type=str, nargs="?", const="openrlm:sandbox",
                         default=None, metavar="TAG",
-                        help="Build the Docker sandbox image and exit (default tag: arcgeneral:sandbox)")
+                        help="Build the Docker sandbox image and exit (default tag: openrlm:sandbox)")
     parser.add_argument("--sandbox-deps", type=str, default=None, metavar="FILE",
                         help="Dependencies file for --build-image (default: sandbox-deps.txt if it exists)")
     # Codex-specific options (only used when --provider openai-codex)
@@ -101,7 +101,7 @@ def main():
     args = parse_args()
 
     if args.build_image:
-        from arcgeneral.ipybox.build import build
+        from openrlm.ipybox.build import build
         deps_file = None
         if args.sandbox_deps:
             deps_file = Path(args.sandbox_deps)
@@ -118,7 +118,7 @@ def main():
         level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    arc_logger = logging.getLogger("arcgeneral")
+    arc_logger = logging.getLogger("openrlm")
     arc_logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     file_handler = logging.FileHandler(args.log_file, mode="a", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
@@ -170,7 +170,7 @@ def main():
                 await cleanup_orphaned_containers()
             on_event = None
             if args.json:
-                from arcgeneral.events import EventBus
+                from openrlm.events import EventBus
                 bus = EventBus()
                 bus.add_listener(lambda event: (
                     sys.stderr.write(json.dumps({"type": type(event).__name__, **dataclasses.asdict(event)}) + "\n"),
@@ -217,7 +217,7 @@ def main():
                 for sig in (signal.SIGTERM, signal.SIGINT):
                     loop.add_signal_handler(sig, _on_signal)
                 mode = "docker" if args.image else "local"
-                print(f"arcgeneral session started ({mode} mode). Type 'quit' or 'exit' to end.\n")
+                print(f"openrlm session started ({mode} mode). Type 'quit' or 'exit' to end.\n")
                 while not shutdown.is_set():
                     try:
                         user_input = await loop.run_in_executor(None, input, ">>> ")

@@ -1,4 +1,4 @@
-"""Fork server for arcgeneral sandboxes.
+"""Fork server for openrlm sandboxes.
 
 Single Python file, zero non-stdlib dependencies. Runs as PID 1 in the container.
 
@@ -50,8 +50,8 @@ import struct
 import sys
 import traceback
 
-DATA_PORT = int(os.environ.get("ARCGENERAL_DATA_PORT", 8888))
-CONTROL_PORT = int(os.environ.get("ARCGENERAL_CONTROL_PORT", 8889))
+DATA_PORT = int(os.environ.get("OPENRLM_DATA_PORT", 8888))
+CONTROL_PORT = int(os.environ.get("OPENRLM_CONTROL_PORT", 8889))
 
 # ── Pre-import expensive packages (before any fork) ──────────────────
 
@@ -422,7 +422,7 @@ def _sigchld_handler(signum, frame):
 # ── Main ─────────────────────────────────────────────────────────────
 
 async def _serve():
-    bind_host = os.environ.get("ARCGENERAL_BIND_HOST", "0.0.0.0")
+    bind_host = os.environ.get("OPENRLM_BIND_HOST", "0.0.0.0")
     data_server = await asyncio.start_server(_handle_data, bind_host, DATA_PORT)
     control_server = await asyncio.start_server(_handle_control, bind_host, CONTROL_PORT)
     print(f"fork server ready on data={DATA_PORT} control={CONTROL_PORT}", flush=True)

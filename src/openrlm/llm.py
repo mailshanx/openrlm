@@ -69,7 +69,7 @@ PROVIDER_ENV_VARS: dict[str, str] = {
     "openai-codex": "OPENAI_CODEX_TOKEN",
 }
 
-_DEFAULT_AUTH_FILE = Path.home() / ".arcgeneral" / "auth.json"
+_DEFAULT_AUTH_FILE = Path.home() / ".openrlm" / "auth.json"
 
 
 def _read_auth_file(provider: str) -> str | None:
@@ -78,11 +78,11 @@ def _read_auth_file(provider: str) -> str | None:
     The auth file is a JSON object mapping provider names to API keys:
         {"anthropic": "sk-ant-...", "openrouter": "or-..."}
 
-    Location: ~/.arcgeneral/auth.json (override with ARCGENERAL_AUTH_FILE).
+    Location: ~/.openrlm/auth.json (override with OPENRLM_AUTH_FILE).
     Re-read on every call so external refreshers (e.g. Pi extension) can
     update it mid-run.
     """
-    auth_path = os.environ.get("ARCGENERAL_AUTH_FILE")
+    auth_path = os.environ.get("OPENRLM_AUTH_FILE")
     path = Path(auth_path) if auth_path else _DEFAULT_AUTH_FILE
     try:
         data = _json.loads(path.read_text())
@@ -97,7 +97,7 @@ def _read_auth_file(provider: str) -> str | None:
 def default_api_key_resolver() -> Callable[[str], Awaitable[str]]:
     """Build a resolver that reads API keys from the auth file and environment.
     Resolution priority for any provider:
-      1. Auth file (~/.arcgeneral/auth.json or ARCGENERAL_AUTH_FILE)
+      1. Auth file (~/.openrlm/auth.json or OPENRLM_AUTH_FILE)
       2. ANTHROPIC_OAUTH_TOKEN (Anthropic only, legacy compat)
       3. Provider-specific env var (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, etc.)
     """
@@ -124,7 +124,7 @@ def default_api_key_resolver() -> Callable[[str], Awaitable[str]]:
         raise ValueError(
             f"No API key for provider {provider!r}. "
             f"Set the {env_var} environment variable "
-            f"or add it to ~/.arcgeneral/auth.json."
+            f"or add it to ~/.openrlm/auth.json."
         )
     return resolve
 

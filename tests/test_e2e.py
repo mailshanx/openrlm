@@ -1,9 +1,9 @@
-"""End-to-end integration tests for arcgeneral.
+"""End-to-end integration tests for openrlm.
 
 Tests everything except the agent loop (run_agent), which requires API keys.
 
-Requires Docker running and the arcgeneral:sandbox image built:
-    python -c "from arcgeneral.ipybox.build import build; from pathlib import Path; build('arcgeneral:sandbox', Path('sandbox-deps.txt'))"
+Requires Docker running and the openrlm:sandbox image built:
+    python -c "from openrlm.ipybox.build import build; from pathlib import Path; build('openrlm:sandbox', Path('sandbox-deps.txt'))"
 
 Run:
     uv run python tests/test_e2e.py
@@ -16,23 +16,23 @@ import os
 from pathlib import Path
 from dataclasses import dataclass
 
-from arcgeneral.agent import DEFAULT_SYSTEM_PROMPT
-from arcgeneral.config import AgentConfig
-from arcgeneral.sandbox import ForkServer, LocalForkServer, Sandbox
-from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
-from arcgeneral.host_functions import HostFunctionRegistry
-from arcgeneral.agent import AgentRuntime, Session
-from arcgeneral.events import (
+from openrlm.agent import DEFAULT_SYSTEM_PROMPT
+from openrlm.config import AgentConfig
+from openrlm.sandbox import ForkServer, LocalForkServer, Sandbox
+from openrlm.tool import PYTHON_TOOL_SCHEMA, execute_tool
+from openrlm.host_functions import HostFunctionRegistry
+from openrlm.agent import AgentRuntime, Session
+from openrlm.events import (
     AgentEvent, EventCallback, EventBus, EventStream,
     RoundStart, ModelRequest, ModelResponse,
     ToolExecStart, ToolExecEnd, TurnEnd,
 )
-from arcgeneral.llm import (
+from openrlm.llm import (
     CompletionResponse, CompletionChoice, CompletionMessage,
     ToolCall, ToolCallFunction, TokenUsage, OpenRouterClient, AnthropicClient,
 )
 
-TAG = "arcgeneral:sandbox"
+TAG = "openrlm:sandbox"
 
 
 async def _test_api_key():
@@ -138,11 +138,11 @@ async def test_tool_schema_json_serializable():
 # ---------------------------------------------------------------------------
 
 async def test_cli_parse_defaults():
-    from arcgeneral.cli import parse_args
+    from openrlm.cli import parse_args
     # parse_args reads sys.argv; temporarily replace it
     original_argv = sys.argv
     try:
-        sys.argv = ["arcgeneral", "hello world"]
+        sys.argv = ["openrlm", "hello world"]
         args = parse_args()
         report("cli_message", args.message == "hello world")
         report("cli_default_model", isinstance(args.model, str) and len(args.model) > 0)
@@ -157,11 +157,11 @@ async def test_cli_parse_defaults():
 
 
 async def test_cli_parse_overrides():
-    from arcgeneral.cli import parse_args
+    from openrlm.cli import parse_args
     original_argv = sys.argv
     try:
         sys.argv = [
-            "arcgeneral",
+            "openrlm",
             "compute stuff",
             "--model", "openai/gpt-4o-mini",
             "--provider", "anthropic",
@@ -186,13 +186,13 @@ async def test_cli_parse_overrides():
 
 async def test_cli_functions_flag():
     """--functions flag parses into a list; _load_functions imports and calls register()."""
-    from arcgeneral.cli import parse_args
-    from arcgeneral.runtime_factory import load_functions as _load_functions
+    from openrlm.cli import parse_args
+    from openrlm.runtime_factory import load_functions as _load_functions
 
     # Test parsing: comma-separated modules
     original_argv = sys.argv
     try:
-        sys.argv = ["arcgeneral", "hello", "--functions", "mod_a,mod_b"]
+        sys.argv = ["openrlm", "hello", "--functions", "mod_a,mod_b"]
         args = parse_args()
         report("cli_functions_parsed", args.functions == "mod_a,mod_b", repr(args.functions))
     finally:
@@ -200,7 +200,7 @@ async def test_cli_functions_flag():
 
     # Test parsing: no --functions gives None
     try:
-        sys.argv = ["arcgeneral", "hello"]
+        sys.argv = ["openrlm", "hello"]
         args = parse_args()
         report("cli_functions_default_none", args.functions is None, repr(args.functions))
     finally:
@@ -294,13 +294,13 @@ async def test_cli_functions_flag():
 async def test_cli_context_and_json_flags():
     """--context and --json flags parse correctly; context file is validated."""
     import tempfile
-    from arcgeneral.cli import parse_args
+    from openrlm.cli import parse_args
 
     original_argv = sys.argv
 
     # --context and --json parse correctly
     try:
-        sys.argv = ["arcgeneral", "hello", "--context", "/tmp/ctx.json", "--json"]
+        sys.argv = ["openrlm", "hello", "--context", "/tmp/ctx.json", "--json"]
         args = parse_args()
         report("cli_context_parsed", args.context == "/tmp/ctx.json")
         report("cli_json_parsed", args.json is True)
@@ -309,7 +309,7 @@ async def test_cli_context_and_json_flags():
 
     # Defaults: no context, no json
     try:
-        sys.argv = ["arcgeneral", "hello"]
+        sys.argv = ["openrlm", "hello"]
         args = parse_args()
         report("cli_context_default_none", args.context is None)
         report("cli_json_default_false", args.json is False)
@@ -332,9 +332,9 @@ async def test_cli_context_and_json_flags():
         json.dump([{"role": "system", "content": "bad"}], f)
         bad_role_path = f.name
     # The validation happens in main(), not parse_args(), so we test the validation logic directly
-    from arcgeneral.cli import main as _cli_main
+    from openrlm.cli import main as _cli_main
     try:
-        sys.argv = ["arcgeneral", "hello", "--context", bad_role_path]
+        sys.argv = ["openrlm", "hello", "--context", bad_role_path]
         _cli_main()
         report("cli_context_invalid_role_fails", False, "should have raised")
     except SystemExit as e:
@@ -345,7 +345,7 @@ async def test_cli_context_and_json_flags():
 
     # Context file validation: missing file
     try:
-        sys.argv = ["arcgeneral", "hello", "--context", "/nonexistent/ctx.json"]
+        sys.argv = ["openrlm", "hello", "--context", "/nonexistent/ctx.json"]
         _cli_main()
         report("cli_context_missing_file_fails", False, "should have raised")
     except SystemExit as e:
@@ -355,7 +355,7 @@ async def test_cli_context_and_json_flags():
 
     # --json without message should fail
     try:
-        sys.argv = ["arcgeneral", "--json"]
+        sys.argv = ["openrlm", "--json"]
         _cli_main()
         report("cli_json_requires_message", False, "should have raised")
     except SystemExit as e:
@@ -1738,16 +1738,16 @@ async def test_anthropic_non_oauth_system_prompt_unchanged():
 
 async def test_anthropic_oauth_token_env_precedence():
     """ANTHROPIC_OAUTH_TOKEN takes precedence over ANTHROPIC_API_KEY for anthropic provider."""
-    from arcgeneral.llm import default_api_key_resolver
+    from openrlm.llm import default_api_key_resolver
 
     resolver = default_api_key_resolver()
 
     # Disable auth file so we're testing env var precedence only
-    old_auth_file = os.environ.get("ARCGENERAL_AUTH_FILE")
+    old_auth_file = os.environ.get("OPENRLM_AUTH_FILE")
     old_oauth = os.environ.get("ANTHROPIC_OAUTH_TOKEN")
     old_api = os.environ.get("ANTHROPIC_API_KEY")
     try:
-        os.environ["ARCGENERAL_AUTH_FILE"] = "/nonexistent/auth.json"
+        os.environ["OPENRLM_AUTH_FILE"] = "/nonexistent/auth.json"
         os.environ["ANTHROPIC_OAUTH_TOKEN"] = "sk-ant-oat-from-oauth-env"
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-api01-from-api-env"
         key = await resolver("anthropic")
@@ -1765,9 +1765,9 @@ async def test_anthropic_oauth_token_env_precedence():
     finally:
         # Restore
         if old_auth_file is not None:
-            os.environ["ARCGENERAL_AUTH_FILE"] = old_auth_file
-        elif "ARCGENERAL_AUTH_FILE" in os.environ:
-            del os.environ["ARCGENERAL_AUTH_FILE"]
+            os.environ["OPENRLM_AUTH_FILE"] = old_auth_file
+        elif "OPENRLM_AUTH_FILE" in os.environ:
+            del os.environ["OPENRLM_AUTH_FILE"]
         if old_oauth is not None:
             os.environ["ANTHROPIC_OAUTH_TOKEN"] = old_oauth
         elif "ANTHROPIC_OAUTH_TOKEN" in os.environ:
@@ -1779,20 +1779,20 @@ async def test_anthropic_oauth_token_env_precedence():
 
 
 async def test_auth_file_resolver():
-    """Auth file (~/.arcgeneral/auth.json) takes highest priority for all providers."""
+    """Auth file (~/.openrlm/auth.json) takes highest priority for all providers."""
     import tempfile
     import json
-    from arcgeneral.llm import default_api_key_resolver
+    from openrlm.llm import default_api_key_resolver
     resolver = default_api_key_resolver()
 
-    old_af = os.environ.get("ARCGENERAL_AUTH_FILE")
+    old_af = os.environ.get("OPENRLM_AUTH_FILE")
     old_oauth = os.environ.get("ANTHROPIC_OAUTH_TOKEN")
     old_api = os.environ.get("ANTHROPIC_API_KEY")
     old_or = os.environ.get("OPENROUTER_API_KEY")
     auth_dir = tempfile.mkdtemp()
     auth_path = os.path.join(auth_dir, "auth.json")
     try:
-        os.environ["ARCGENERAL_AUTH_FILE"] = auth_path
+        os.environ["OPENRLM_AUTH_FILE"] = auth_path
         os.environ["ANTHROPIC_OAUTH_TOKEN"] = "sk-ant-oat-from-oauth-env"
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-api01-from-api-env"
         os.environ["OPENROUTER_API_KEY"] = "or-from-env"
@@ -1833,9 +1833,9 @@ async def test_auth_file_resolver():
         report("auth_file_invalid_json", key6 == "sk-ant-oat-from-oauth-env")
     finally:
         if old_af is not None:
-            os.environ["ARCGENERAL_AUTH_FILE"] = old_af
-        elif "ARCGENERAL_AUTH_FILE" in os.environ:
-            del os.environ["ARCGENERAL_AUTH_FILE"]
+            os.environ["OPENRLM_AUTH_FILE"] = old_af
+        elif "OPENRLM_AUTH_FILE" in os.environ:
+            del os.environ["OPENRLM_AUTH_FILE"]
         if old_oauth is not None:
             os.environ["ANTHROPIC_OAUTH_TOKEN"] = old_oauth
         elif "ANTHROPIC_OAUTH_TOKEN" in os.environ:

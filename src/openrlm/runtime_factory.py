@@ -9,10 +9,10 @@ import importlib
 import importlib.util
 from pathlib import Path
 
-from arcgeneral.agent import AgentRuntime
-from arcgeneral.config import AgentConfig
-from arcgeneral.host_functions import HostFunctionRegistry
-from arcgeneral.llm import (
+from openrlm.agent import AgentRuntime
+from openrlm.config import AgentConfig
+from openrlm.host_functions import HostFunctionRegistry
+from openrlm.llm import (
     LLMClient,
     OpenRouterClient,
     AnthropicClient,
@@ -74,7 +74,7 @@ def load_functions(registry: HostFunctionRegistry, specs: list[str]) -> None:
                 raise SystemExit(
                     f"Error: could not import function module {spec!r}: {e}\n"
                     f"Hint: if installed via 'uv tool', re-install with: "
-                    f"uv tool install arcgeneral --with <package>"
+                    f"uv tool install openrlm --with <package>"
                 ) from e
             _register_module(registry, module, spec)
 
@@ -94,7 +94,7 @@ def build_llm_client(
     if provider == "anthropic":
         return AnthropicClient()
     elif provider == "openai-codex":
-        from arcgeneral.codex import CodexClient
+        from openrlm.codex import CodexClient
         return CodexClient(
             reasoning_effort=reasoning_effort,
             reasoning_summary=reasoning_summary,

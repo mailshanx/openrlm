@@ -1,4 +1,4 @@
-# arcgeneral
+# openrlm
 
 A recursive language model (RLM) agent harness with persistent IPython REPL environments. Usable as a CLI, embedded in an existing harness, or as a library.
 
@@ -15,7 +15,7 @@ Each agent gets a stateful IPython environment where it can persist variables, d
 - **Cheap sub-agent spawning.** Sub-agents are forked processes. The fork server pre-imports expensive packages (numpy, pandas, etc.), then calls `gc.freeze()` before forking. Children inherit all imported modules via copy-on-write pages, and `gc.freeze()` prevents the garbage collector from scanning those objects — which would dirty the pages and force real memory copies. The OS only allocates memory for new data each sub-agent creates. A single machine can support hundreds to thousands of concurrent sub-agents.
 
 ## Architecture
-arcgeneral has two layers: a **core** that handles single-message execution, and a **harness** that adds multi-turn state management on top.
+openrlm has two layers: a **core** that handles single-message execution, and a **harness** that adds multi-turn state management on top.
 
 ### Core: one-shot execution
 
@@ -25,7 +25,7 @@ The core takes a single message and runs a complete LLM↔REPL loop: the LLM emi
 
 ```python
 import asyncio
-from arcgeneral import build_runtime
+from openrlm import build_runtime
 
 async def main():
     runtime = build_runtime(model="openai/gpt-5.2")
@@ -97,30 +97,30 @@ async with runtime:
 ## Installation
 
 ```bash
-pip install arcgeneral
+pip install openrlm
 # or
-uv pip install arcgeneral
+uv pip install openrlm
 ```
 
 To use the bundled internet search/extract tools:
 
 ```bash
-pip install arcgeneral[contrib]
+pip install openrlm[contrib]
 ```
 
 To use Docker mode, build the sandbox image:
 ```bash
-arcgeneral --build-image
+openrlm --build-image
 ```
 
-This builds `arcgeneral:sandbox` using `sandbox-deps.txt` if present in the current directory. To customize:
+This builds `openrlm:sandbox` using `sandbox-deps.txt` if present in the current directory. To customize:
 
 ```bash
 # Custom tag
-arcgeneral --build-image my-image:latest
+openrlm --build-image my-image:latest
 
 # Custom dependencies file
-arcgeneral --build-image --sandbox-deps my-deps.txt
+openrlm --build-image --sandbox-deps my-deps.txt
 ```
 
 ## Quickstart
@@ -129,28 +129,28 @@ arcgeneral --build-image --sandbox-deps my-deps.txt
 
 ```bash
 # Single message (local mode, default)
-arcgeneral "compute the first 20 prime numbers"
+openrlm "compute the first 20 prime numbers"
 
 # Interactive session
-arcgeneral
+openrlm
 
 # With a specific model (routed through OpenRouter)
-arcgeneral --model anthropic/claude-sonnet-4-5 "explain main.py"
+openrlm --model anthropic/claude-sonnet-4-5 "explain main.py"
 
 # With custom tools
-arcgeneral --functions ./my-tools "use my_search to find X"
+openrlm --functions ./my-tools "use my_search to find X"
 
 # With bundled contrib tools (requires PARALLEL_API_KEY)
-arcgeneral --functions ./contrib "search for recent advances in fusion energy"
+openrlm --functions ./contrib "search for recent advances in fusion energy"
 
 # Docker mode
-arcgeneral --image arcgeneral:sandbox "analyze data"
+openrlm --image openrlm:sandbox "analyze data"
 
 # JSON output for programmatic use
-arcgeneral --json "compute pi to 50 digits" | jq .result
+openrlm --json "compute pi to 50 digits" | jq .result
 
 # With conversation context from a prior session
-arcgeneral --context history.json "continue the analysis"
+openrlm --context history.json "continue the analysis"
 ```
 
 ### Library
@@ -158,7 +158,7 @@ arcgeneral --context history.json "continue the analysis"
 
 ```python
 import asyncio
-from arcgeneral import build_runtime
+from openrlm import build_runtime
 
 async def main():
     runtime = build_runtime(
@@ -184,7 +184,7 @@ asyncio.run(main())
 When you need more control — a custom `LLMClient` implementation, programmatic host function registration, or non-default `AgentConfig` settings — construct the `AgentRuntime` directly:
 
 ```python
-from arcgeneral import (
+from openrlm import (
     AgentRuntime, AgentConfig, HostFunctionRegistry,
     AnthropicClient, default_api_key_resolver,
 )
@@ -219,7 +219,7 @@ For programmatic registration (e.g., closures that capture application state), c
 
 ```python
 import json
-from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
+from openrlm import AgentRuntime, AgentConfig, HostFunctionRegistry
 
 async def my_database_query(sql: str, limit: int = 100) -> str:
     """Execute a SQL query against the application database.
@@ -266,19 +266,19 @@ def register(registry):
 Then:
 
 ```bash
-arcgeneral --functions my_tools.py "show me the top 10 users"
+openrlm --functions my_tools.py "show me the top 10 users"
 ```
 
 For a directory of tool files, each `.py` file with a `register()` function is loaded automatically (files starting with `_` are skipped):
 
 ```bash
-arcgeneral --functions ./my-tools/ "analyze the data"
+openrlm --functions ./my-tools/ "analyze the data"
 ```
 
 You can also use a dotted module name for installed packages:
 
 ```bash
-arcgeneral --functions my_package.tools "do something"
+openrlm --functions my_package.tools "do something"
 ```
 
 ### Event Streaming
@@ -286,8 +286,8 @@ arcgeneral --functions my_package.tools "do something"
 Monitor agent activity with event callbacks. Events from sub-agents at any depth flow through the same callback, distinguished by `agent_id`:
 
 ```python
-from arcgeneral import build_runtime, EventCallback
-from arcgeneral.events import RoundStart, ToolExecEnd, TurnEnd
+from openrlm import build_runtime, EventCallback
+from openrlm.events import RoundStart, ToolExecEnd, TurnEnd
 
 def on_event(event):
     match event:
@@ -306,7 +306,7 @@ async with runtime:
 The `on_event` parameter accepts any `EventCallback` (`Callable[[AgentEvent], None]`). For multiple consumers or async I/O, use `EventBus`:
 
 ```python
-from arcgeneral import EventBus
+from openrlm import EventBus
 
 bus = EventBus()
 bus.add_listener(tui.update_panel)       # sync: immediate UI update
@@ -392,7 +392,7 @@ The maximum recursion depth is configurable (default: 10 levels).
 
 `AgentConfig.get_api_key` is caller-provided. The bundled `default_api_key_resolver()` checks these sources in order:
 
-1. **Auth file** (`~/.arcgeneral/auth.json`, override with `ARCGENERAL_AUTH_FILE`): a JSON object mapping provider names to keys.
+1. **Auth file** (`~/.openrlm/auth.json`, override with `OPENRLM_AUTH_FILE`): a JSON object mapping provider names to keys.
 2. **`ANTHROPIC_OAUTH_TOKEN`** (Anthropic only, legacy compatibility).
 3. **Provider-specific environment variable:**
 | Provider | Environment Variable |
@@ -413,7 +413,7 @@ For the bundled contrib tools (`internet_search`, `internet_extract`), set `PARA
 ### CLI Flags
 
 ```
-arcgeneral [message] [options]
+openrlm [message] [options]
 
 positional:
   message                 User message (omit for interactive session)
@@ -430,8 +430,8 @@ options:
   --json                  Output result as JSON object
   --verbose               Enable debug logging
   --env-file PATH         Path to .env file (default: .env)
-  --log-file PATH         Log file path (default: ~/Downloads/arcgeneral.log)
-  --build-image [TAG]   Build Docker sandbox image and exit (default: arcgeneral:sandbox)
+  --log-file PATH         Log file path (default: ~/Downloads/openrlm.log)
+  --build-image [TAG]   Build Docker sandbox image and exit (default: openrlm:sandbox)
   --sandbox-deps FILE   Dependencies file for --build-image (default: sandbox-deps.txt)
   --reasoning-effort E  Reasoning effort for Codex models: none, minimal, low, medium, high, xhigh (default: medium)
   --text-verbosity V    Text verbosity for Codex models: low, medium, high (default: medium)
@@ -459,7 +459,7 @@ Wraps the result in a JSON object for programmatic consumption. Only valid with 
 {"result": "The answer is 42", "error": null}
 
 // Failure
-{"result": null, "error": "No API key for provider 'openrouter'. Set the OPENROUTER_API_KEY environment variable or add it to ~/.arcgeneral/auth.json."}
+{"result": null, "error": "No API key for provider 'openrouter'. Set the OPENROUTER_API_KEY environment variable or add it to ~/.openrlm/auth.json."}
 ```
 
 Exactly one of `result` or `error` is non-null.
@@ -476,15 +476,15 @@ The `contrib/` directory includes two pre-built host functions that use the [Par
 - **`internet_search`** — Search the web and return relevant excerpts with source URLs.
 - **`internet_extract`** — Fetch a web page or PDF and return its content as markdown.
 
-Both require `PARALLEL_API_KEY` in the environment and the `contrib` extra (`pip install arcgeneral[contrib]`).
+Both require `PARALLEL_API_KEY` in the environment and the `contrib` extra (`pip install openrlm[contrib]`).
 
 ```bash
-arcgeneral --functions ./contrib "search for recent papers on transformer efficiency"
+openrlm --functions ./contrib "search for recent papers on transformer efficiency"
 ```
 
 ## LLM Client
 
-arcgeneral ships with two bundled client implementations:
+openrlm ships with two bundled client implementations:
 - **OpenRouterClient** — routes to models from OpenAI, Anthropic, Google, and others through a single API.
 - **AnthropicClient** — calls the Anthropic API directly.
 
@@ -493,8 +493,8 @@ arcgeneral ships with two bundled client implementations:
 To implement a custom provider:
 
 ```python
-from arcgeneral import AgentRuntime, AgentConfig, HostFunctionRegistry
-from arcgeneral import LLMClient, CompletionResponse, CompletionChoice, CompletionMessage, TokenUsage, default_api_key_resolver
+from openrlm import AgentRuntime, AgentConfig, HostFunctionRegistry
+from openrlm import LLMClient, CompletionResponse, CompletionChoice, CompletionMessage, TokenUsage, default_api_key_resolver
 
 class MyCustomClient:
     """Example: implement LLMClient for a provider not built in."""
@@ -532,14 +532,14 @@ async def main():
 ```bash
 # Clone and install
 git clone <repo-url>
-cd arcgeneral
+cd openrlm
 uv sync
 
 # Run tests (requires Docker for full suite)
 uv run python tests/test_e2e.py
 
 # Build sandbox image (for Docker mode tests)
-arcgeneral --build-image
+openrlm --build-image
 ```
 
 ## License

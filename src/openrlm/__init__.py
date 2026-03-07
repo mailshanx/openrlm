@@ -1,4 +1,4 @@
-from arcgeneral.events import (
+from openrlm.events import (
     AgentEvent,
     EventCallback,
     EventBus,
@@ -13,7 +13,7 @@ from arcgeneral.events import (
     TaskStarted,
     TaskCompleted,
 )
-from arcgeneral.llm import (
+from openrlm.llm import (
     LLMClient,
     OpenRouterClient,
     AnthropicClient,
@@ -26,10 +26,10 @@ from arcgeneral.llm import (
     PROVIDER_ENV_VARS,
     default_api_key_resolver,
 )
-from arcgeneral.codex import CodexClient
-from arcgeneral.agent import Session, RuntimeServices
-from arcgeneral.agent import AgentRuntime
-from arcgeneral.config import AgentConfig
-from arcgeneral.host_functions import HostFunctionRegistry
-from arcgeneral.sandbox import ForkServer, LocalForkServer, Sandbox
-from arcgeneral.runtime_factory import build_runtime, build_llm_client, load_functions
+from openrlm.codex import CodexClient
+from openrlm.agent import Session, RuntimeServices
+from openrlm.agent import AgentRuntime
+from openrlm.config import AgentConfig
+from openrlm.host_functions import HostFunctionRegistry
+from openrlm.sandbox import ForkServer, LocalForkServer, Sandbox
+from openrlm.runtime_factory import build_runtime, build_llm_client, load_functions

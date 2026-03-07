@@ -9,13 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Self
 
-from arcgeneral.llm import LLMClient, CompletionResponse
+from openrlm.llm import LLMClient, CompletionResponse
 
-from arcgeneral.config import AgentConfig
-from arcgeneral.host_functions import HostFunctionRegistry, HostFunctionServer
-from arcgeneral.sandbox import ForkServer, LocalForkServer, Sandbox
-from arcgeneral.tool import PYTHON_TOOL_SCHEMA, execute_tool
-from arcgeneral.events import (AgentEvent, EventCallback, RoundStart, ModelRequest, ModelResponse,
+from openrlm.config import AgentConfig
+from openrlm.host_functions import HostFunctionRegistry, HostFunctionServer
+from openrlm.sandbox import ForkServer, LocalForkServer, Sandbox
+from openrlm.tool import PYTHON_TOOL_SCHEMA, execute_tool
+from openrlm.events import (AgentEvent, EventCallback, RoundStart, ModelRequest, ModelResponse,
                                ToolExecStart, ToolExecEnd, TurnEnd, AgentCreated, TaskStarted,
                                TaskCompleted)
 
@@ -796,7 +796,7 @@ class AgentRuntime:
             await self._server.__aenter__()
 
         # Create temp spool dir
-        self._spool_dir = Path(tempfile.mkdtemp(prefix="arcgeneral_spool_"))
+        self._spool_dir = Path(tempfile.mkdtemp(prefix="openrlm_spool_"))
         if self._config.sandbox_image:
             # Docker mode: bind-mount workspace and spool into container
             binds = dict(self._config.sandbox_binds)
