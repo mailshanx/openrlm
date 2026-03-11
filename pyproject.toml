@@ -1,9 +1,24 @@
 [project]
 name = "openrlm"
 version = "0.1.0"
-description = "RLM based agent harness and CLI with persistent iPython repl tool"
-requires-python = ">=3.13"
+description = "Recursive LLM agent harness and CLI with a persistent IPython REPL"
+readme = "README.md"
+requires-python = ">=3.12"
 license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Shankar", email = "orthogonal.eigenvector@gmail.com" },
+]
+keywords = ["llm", "agent", "cli", "repl", "sandbox", "recursive"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "aiodocker>=0.23.0",
     "openrouter>=0.6.0",
@@ -17,13 +32,19 @@ dependencies = [
 contrib = [
     "parallel-web>=0.3.4",
 ]
+
 [project.scripts]
 openrlm = "openrlm.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mailshanx/openrlm"
+Repository = "https://github.com/mailshanx/openrlm"
+Issues = "https://github.com/mailshanx/openrlm/issues"
 
 [tool.setuptools.packages.find]
 where = ["src/"]
 include = ["openrlm*"]
 
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools >= 77.0.3"]
 build-backend = "setuptools.build_meta"
